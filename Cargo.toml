@@ -1,0 +1,67 @@
+[package]
+name = "puzzle-hunter-pro"
+version = "1.0.0"
+edition = "2024"
+description = "Specialized Pro solver for the 1000 Bitcoin Puzzle"
+authors = ["Control Owl <c0ntr01-_-0w1[at]r-o0-t[dot]wtf>"]
+license = "LICENSE"
+repository = "https://github.com/control-owl/puzzle-hunter-pro"
+readme = "README.md"
+
+
+[dependencies]
+secp256k1 = "0.33.1"
+ripemd = "0.2.0"
+sha2 = "0.11.1"
+bs58 = "0.5.1"
+rayon = "1.12.0"
+lazy_static = "1.5.1"
+num_cpus = "1.17.0"
+hex = "0.4.3"
+core_affinity = "0.8.3"
+chrono = "0.4.45"
+
+cudarc = { version = "0.19.10", default-features = false, features = [
+  "driver",
+  "runtime",
+  "dynamic-loading",
+  "nvrtc",
+] }
+
+eframe = "0.37.0"
+egui = "0.37.0"
+egui_extras = "0.37.0"
+include_dir = "0.7.4"
+rfd = "0.18.0"
+zeroize = "1.9.1"
+zstd = "0.14.3"
+aes-gcm = "0.11.1"
+hkdf = "0.13.0"
+tray-icon = { version = "0.26.1", default-features = false, features = [
+  "ksni",
+] }
+png = "0.18.1"
+system-idle-time = "1.0.4"
+
+# Windows
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+
+[features]
+default = ["cuda-13040"]
+
+# Legacy support - CUDA 11.x for older architectures (sm_30 - sm_37)
+cuda-11080 = ["cudarc/cuda-11080"]
+
+# Standard support - CUDA 12.3 (sm_50 - sm_120)
+cuda-12030 = ["cudarc/cuda-12030"]
+
+# Newest support - CUDA 13.0 (sm_50 - sm_121)
+cuda-13040 = ["cudarc/cuda-13040"]
+
+
+test_vectors = []

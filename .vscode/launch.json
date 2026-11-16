@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run puzzle-hunter-pro",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=puzzle-hunter-pro",
+          "--features=default",
+        ]
+      },
+      "args": []
+    },
+    {
+      "name": "Test puzzle-hunter-pro",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--bin=puzzle-hunter-pro",
+          "--features=test_vectors",
+        ]
+      },
+      "args": []
+    },
+  ]
+}
