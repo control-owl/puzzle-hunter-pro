@@ -1,34 +1,34 @@
-/// authors = ["Control Owl <c0ntr01-_-0w1[at]r-o0-t[dot]wtf>"]
-/// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
-/// CTRLOWL License
-/// Copyright (c) 2025-2026 Control Owl. All rights reserved.
-///
-/// 1. Host Application
-///    The free host application (binary) may be used and redistributed freely
-///    provided it remains unmodified and this copyright notice is preserved.
-///    You may not modify, reverse-engineer, rebrand, or sell the host application.
-///
-/// 2. Kernel Packages
-///    The kernel packages (.OWL files) are commercial, closed-source products.
-///    They are licensed strictly for use on the single machine whose hardware
-///    fingerprint matches the one submitted at purchase.
-///    You may not copy, share, redistribute, reverse-engineer, decompile,
-///    disassemble, modify, or attempt to extract the kernels in any way.
-///    Additional licenses may be purchased for additional machines.
-///
-/// 3. No Warranty - As Is
-///    The software and kernels are provided "AS IS" without warranty of any kind,
-///    express or implied. The author is not liable for any damages, losses,
-///    failed searches, hardware issues, driver problems, or inability to run
-///    the software on your system. By using or purchasing you accept full
-///    responsibility for your environment and results.
-///
-/// 4. Acceptance
-///    Using the host application or purchasing a kernel package constitutes
-///    acceptance of these terms. If you do not agree, do not use or buy.
-///    
-///    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
-///
+// authors = ["Control Owl <c0ntr01-_-0w1[at]r-o0-t[dot]wtf>"]
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+// CTRLOWL License 1.0
+// Copyright (c) 2025-2026 Control Owl. All rights reserved.
+//
+// 1. Host Application
+//    The free host application (binary) may be used and redistributed freely
+//    provided it remains unmodified and this copyright notice is preserved.
+//    You may not modify, reverse-engineer, rebrand, or sell the host application.
+//
+// 2. Kernel Packages
+//    The kernel packages (.OWL files) are commercial, closed-source products.
+//    They are licensed strictly for use on the single machine whose hardware
+//    fingerprint matches the one submitted at purchase.
+//    You may not copy, share, redistribute, reverse-engineer, decompile,
+//    disassemble, modify, or attempt to extract the kernels in any way.
+//    Additional licenses may be purchased for additional machines.
+//
+// 3. No Warranty - As Is
+//    The software and kernels are provided "AS IS" without warranty of any kind,
+//    express or implied. The author is not liable for any damages, losses,
+//    failed searches, hardware issues, driver problems, or inability to run
+//    the software on your system. By using or purchasing you accept full
+//    responsibility for your environment and results.
+//
+// 4. Acceptance
+//    Using the host application or purchasing a kernel package constitutes
+//    acceptance of these terms. If you do not agree, do not use or buy.
+//
+//    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
 use super::PuzzleInfo;
 
 #[derive(Clone, Copy, Debug)]
