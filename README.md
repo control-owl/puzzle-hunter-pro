@@ -115,7 +115,7 @@ Full-speed CUDA kernels are delivered as `.OWL` packages:
 - Persistent progress and clean resume
 - License request flow (collects machine fingerprint + GPU info, builds an encrypted payload you email after payment)
 
-> [NOTE]
+> [!NOTE]
 > There is a **GPU demo** available upon request.
 
 ---
