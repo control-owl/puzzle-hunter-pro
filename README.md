@@ -2,7 +2,6 @@
 
 ### Specialized Pro solver for the "1000 BTC Bitcoin Puzzle"
 
-### Light theme
 <img src="./.github/preview/latest-dashboard.png" alt="Dashboard" width="800">
 
 **Free host application. Commercial high-performance CUDA kernels.**
