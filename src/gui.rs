@@ -411,22 +411,33 @@ pub struct KeyHunterApp {
   tray_icon_kind: TrayIconKind,
   last_idle_check: Instant,
   pending_kernel_autoload: Option<String>,
+
+  pub show_help_window: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
   Core,
   Solver,
+
+  #[cfg(feature = "next_release")]
   Tray,
 }
 
 impl SettingsTab {
-  pub const ALL: &'static [SettingsTab] = &[SettingsTab::Core, SettingsTab::Solver, SettingsTab::Tray];
+  pub const ALL: &'static [SettingsTab] = &[
+    SettingsTab::Core,
+    SettingsTab::Solver,
+    #[cfg(feature = "next_release")]
+    SettingsTab::Tray,
+  ];
 
   pub fn label(self) -> &'static str {
     match self {
       SettingsTab::Core => "Core",
       SettingsTab::Solver => "Solver",
+
+      #[cfg(feature = "next_release")]
       SettingsTab::Tray => "Tray",
     }
   }
@@ -540,6 +551,7 @@ impl KeyHunterApp {
       loaded_email: None,
 
       show_buy_window: false,
+      show_help_window: false,
       buy_step: 0,
       buy_product: PRO_PRODUCT_ID.to_string(),
       buy_coin: "BTC".to_string(),
@@ -552,8 +564,10 @@ impl KeyHunterApp {
 
       #[cfg(feature = "test_vectors")]
       show_log_window: true,
+
       #[cfg(not(feature = "test_vectors"))]
       show_log_window: false,
+
       log_auto_popup: true,
       log_entries: {
         #[cfg(feature = "test_vectors")]
@@ -580,7 +594,13 @@ impl KeyHunterApp {
       show_settings_window: false,
       settings_tab: SettingsTab::Core,
       settings_status: String::new(),
+
+      #[cfg(feature = "next_release")]
       tray_enabled: true,
+
+      #[cfg(not(feature = "next_release"))]
+      tray_enabled: false,
+
       tray_icon: None,
       tray_hide_item: None,
       tray_idle_item: None,
@@ -589,6 +609,7 @@ impl KeyHunterApp {
       pending_kernel_autoload: None,
     };
 
+    #[cfg(not(feature = "next_release"))]
     match Self::build_tray(app.hide_on_close, app.idle_solving) {
       Ok((icon, hide_item, idle_item)) => {
         app.tray_icon = Some(icon);
@@ -979,7 +1000,13 @@ impl KeyHunterApp {
     self.hide_on_close = true;
     self.idle_solving = false;
     self.idle_minutes = 5;
-    self.tray_enabled = true;
+
+    if cfg!(feature = "next_release") {
+      self.tray_enabled = true;
+    } else {
+      self.tray_enabled = false;
+    }
+
     self.selected_puzzle = DEFAULT_PUZZLE;
     self.all_turn_secs = ALL_MODE_DEFAULT_TURN_SECS;
     self.all_turn_secs_atomic.store(ALL_MODE_DEFAULT_TURN_SECS, Ordering::Relaxed);
@@ -1203,6 +1230,7 @@ impl KeyHunterApp {
     egui::Window::new("Log (F12)")
       .default_size([720.0, 360.0])
       .resizable(true)
+      .collapsible(true)
       .open(&mut open)
       .show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -1759,11 +1787,10 @@ impl KeyHunterApp {
     }
 
     let mut open = true;
-    egui::Window::new("Buy Kernels")
+    egui::Window::new("Buy Kernels (F2)")
       .default_size([560.0, 420.0])
-      .min_size([420.0, 280.0])
       .resizable(true)
-      .constrain(false)
+      .collapsible(true)
       .open(&mut open)
       .show(ctx, |ui| {
         ui.set_min_height(ui.available_height());
@@ -3272,8 +3299,17 @@ impl eframe::App for KeyHunterApp {
     if ui.ctx().input(|i| i.key_pressed(egui::Key::F12)) {
       self.show_log_window = !self.show_log_window;
     }
+
     if ui.ctx().input(|i| i.key_pressed(egui::Key::F10)) {
       self.show_settings_window = !self.show_settings_window;
+    }
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F2)) {
+      self.show_buy_window = !self.show_buy_window;
+    }
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F1)) {
+      self.show_help_window = !self.show_help_window;
     }
 
     let mut start_clicked = false;
@@ -4616,17 +4652,19 @@ impl KeyHunterApp {
     if !self.show_settings_window {
       return;
     }
+
+    #[cfg(feature = "next_release")]
     if self.settings_tab == SettingsTab::Tray && self.idle_solving {
       ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     let mut open = true;
+
     egui::Window::new("Settings  (F10)")
       .open(&mut open)
-      .collapsible(false)
+      .collapsible(true)
       .resizable(true)
       .default_size([560.0, 520.0])
-      .min_size([420.0, 280.0])
       .show(ctx, |ui| {
         ui.horizontal(|ui| {
           for &tab in SettingsTab::ALL {
@@ -4634,6 +4672,8 @@ impl KeyHunterApp {
             let color = match tab {
               SettingsTab::Core => COL_ACCENT,
               SettingsTab::Solver => COL_GPU,
+
+              #[cfg(feature = "next_release")]
               SettingsTab::Tray => COL_CPU,
             };
             let text = if selected {
@@ -4658,6 +4698,8 @@ impl KeyHunterApp {
             match self.settings_tab {
               SettingsTab::Core => self.draw_settings_tab_core(ui),
               SettingsTab::Solver => self.draw_settings_tab_solver(ui),
+
+              #[cfg(feature = "next_release")]
               SettingsTab::Tray => self.draw_settings_tab_tray(ui),
             }
           });
@@ -4715,6 +4757,7 @@ impl KeyHunterApp {
           ui.label(egui::RichText::new(&self.settings_status).small().color(COL_GPU));
         }
       });
+
     if !open {
       self.show_settings_window = false;
     }
@@ -5066,6 +5109,7 @@ impl KeyHunterApp {
     Self::settings_hint(ui, "Loaded from the main window. Path is stored when you Save config.");
   }
 
+  #[cfg(feature = "next_release")]
   fn draw_settings_tab_tray(
     &mut self,
     ui: &mut egui::Ui,
@@ -5130,6 +5174,32 @@ impl KeyHunterApp {
     });
 
     ui.label(egui::RichText::new("Left-click tray: hide/show. Right-click: menu.").small().weak());
+  }
+
+  fn draw_help_window(
+    &mut self,
+    ctx: &egui::Context,
+  ) {
+    if !self.show_help_window {
+      return;
+    }
+
+    let mut open = true;
+
+    egui::Window::new("Help  (F1)")
+      .open(&mut open)
+      .collapsible(true)
+      .resizable(true)
+      .default_size([560.0, 520.0])
+      .show(ctx, |ui| {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+          ui.horizontal(|ui| egui::RichText::new("Help").strong());
+        });
+      });
+
+    if !open {
+      self.show_settings_window = false;
+    }
   }
 }
 

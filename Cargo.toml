@@ -65,3 +65,4 @@ cuda-13040 = ["cudarc/cuda-13040"]
 
 
 test_vectors = []
+next_release = []
