@@ -29,7 +29,6 @@
 //
 //    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
-use bs58;
 use cudarc::{
   driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, result,
@@ -2518,7 +2517,7 @@ fn private_key_to_wif(
   }
   let checksum = {
     let h1 = Sha256::digest(&payload);
-    let h2 = Sha256::digest(&h1);
+    let h2 = Sha256::digest(h1);
     h2[..4].to_vec()
   };
   payload.extend_from_slice(&checksum);
@@ -2955,10 +2954,10 @@ impl KernelRegistry {
             {
               parts.pop();
             }
-            if let Some(sz) = parts.last() {
-              if sz.parse::<u32>().is_ok() {
-                demo_sizes.push((*sz).to_string());
-              }
+            if let Some(sz) = parts.last()
+              && sz.parse::<u32>().is_ok()
+            {
+              demo_sizes.push((*sz).to_string());
             }
           }
         }
@@ -3165,51 +3164,52 @@ pub fn load_kernel_with_registry(
   arch: Option<&str>,
   registry: Option<&KernelRegistry>,
 ) -> Result<KernelInfo, Box<dyn Error>> {
-  if let Some(reg) = registry {
-    if reg.is_demo {
-      let mut demo_candidates: Vec<String> = Vec::new();
+  if let Some(reg) = registry
+    && reg.is_demo
+  {
+    let mut demo_candidates: Vec<String> = Vec::new();
 
-      if let Some(a) = arch {
-        if !a.is_empty() && a != "native" {
-          demo_candidates.push(format!("kernel-demo-{}-{}.cubin", size, a));
-        }
-      }
-      demo_candidates.push(format!("kernel-demo-{}.cubin", size));
-
-      let size_prefix = format!("kernel-demo-{}-", size);
-      for key in reg.images.keys() {
-        if key.starts_with(&size_prefix) && key.ends_with(".cubin") && !demo_candidates.contains(key) {
-          demo_candidates.push(key.clone());
-        }
-      }
-
-      for key in reg.images.keys() {
-        if key.contains("kernel-demo-") && key.ends_with(".cubin") && !demo_candidates.contains(key) {
-          demo_candidates.push(key.clone());
-        }
-      }
-
-      for name in &demo_candidates {
-        if let Some(encrypted) = reg.encrypted_blob(name) {
-          let cubin_bytes = crate::kernel::decrypt_kernel_blob(&reg.machine_fingerprint, encrypted, name).map_err(|e| e.to_string())?;
-          return Ok(KernelInfo {
-            kernel_type: ty,
-            kernel_size: size.to_string(),
-            image_name: name.clone(),
-            cubin_bytes,
-          });
-        }
-      }
-
-      let available: Vec<_> = reg.images.keys().cloned().collect();
-      return Err(
-        format!(
-          "Demo package has no usable CUBIN (tried {:?}). Available: {:?}",
-          demo_candidates, available
-        )
-        .into(),
-      );
+    if let Some(a) = arch
+      && !a.is_empty()
+      && a != "native"
+    {
+      demo_candidates.push(format!("kernel-demo-{}-{}.cubin", size, a));
     }
+    demo_candidates.push(format!("kernel-demo-{}.cubin", size));
+
+    let size_prefix = format!("kernel-demo-{}-", size);
+    for key in reg.images.keys() {
+      if key.starts_with(&size_prefix) && key.ends_with(".cubin") && !demo_candidates.contains(key) {
+        demo_candidates.push(key.clone());
+      }
+    }
+
+    for key in reg.images.keys() {
+      if key.contains("kernel-demo-") && key.ends_with(".cubin") && !demo_candidates.contains(key) {
+        demo_candidates.push(key.clone());
+      }
+    }
+
+    for name in &demo_candidates {
+      if let Some(encrypted) = reg.encrypted_blob(name) {
+        let cubin_bytes = crate::kernel::decrypt_kernel_blob(&reg.machine_fingerprint, encrypted, name).map_err(|e| e.to_string())?;
+        return Ok(KernelInfo {
+          kernel_type: ty,
+          kernel_size: size.to_string(),
+          image_name: name.clone(),
+          cubin_bytes,
+        });
+      }
+    }
+
+    let available: Vec<_> = reg.images.keys().cloned().collect();
+    return Err(
+      format!(
+        "Demo package has no usable CUBIN (tried {:?}). Available: {:?}",
+        demo_candidates, available
+      )
+      .into(),
+    );
   }
 
   let candidates: Vec<String> = {

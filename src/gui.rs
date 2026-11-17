@@ -29,7 +29,6 @@
 //
 //    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
-use eframe::egui;
 use egui::TextWrapMode::Wrap;
 use egui_extras::{Column, TableBuilder};
 use std::{
@@ -85,10 +84,10 @@ fn tray_store_egui_ctx(ctx: &egui::Context) {
 }
 
 fn tray_wake_ui() {
-  if let Ok(slot) = TRAY_EGUI_CTX.lock() {
-    if let Some(ctx) = slot.as_ref() {
-      ctx.request_repaint();
-    }
+  if let Ok(slot) = TRAY_EGUI_CTX.lock()
+    && let Some(ctx) = slot.as_ref()
+  {
+    ctx.request_repaint();
   }
 }
 
@@ -183,8 +182,6 @@ const COL_DEMO: egui::Color32 = egui::Color32::from_rgb(200, 70, 80);
 const COL_PRO_GLOW: egui::Color32 = egui::Color32::from_rgb(80, 220, 160);
 const PRO_PRODUCT_ID: &str = "pro";
 const DEMO_PRODUCT_ID: &str = "demo";
-const LICENSE_REQUEST_SUBJECT_PRO: &str = "I want PRO, bro!";
-const LICENSE_REQUEST_SUBJECT_DEMO: &str = "I want a demo kernel license";
 const MARGIN_NARROW: f32 = 6.0;
 const MARGIN_WIDE: f32 = 12.0;
 const FRAME_W: f32 = 250.0;
@@ -235,6 +232,13 @@ struct ProductOffer {
   bullets: &'static [&'static str],
   price_label: &'static str,
   is_demo: bool,
+}
+
+pub enum DeliveryState {
+  Idle,
+  Sending,
+  Success,
+  Failed(String),
 }
 
 use crate::{
@@ -413,6 +417,9 @@ pub struct KeyHunterApp {
   pending_kernel_autoload: Option<String>,
 
   pub show_help_window: bool,
+
+  delivery_state: DeliveryState,
+  delivery_receiver: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +614,9 @@ impl KeyHunterApp {
       tray_icon_kind: TrayIconKind::Inactive,
       last_idle_check: Instant::now(),
       pending_kernel_autoload: None,
+
+      delivery_state: DeliveryState::Idle,
+      delivery_receiver: None,
     };
 
     #[cfg(not(feature = "next_release"))]
@@ -630,13 +640,13 @@ impl KeyHunterApp {
     } else {
       crate::app_log!("[SETTINGS] Loaded {SETTINGS_FILE}");
 
-      if matches!(app.device.as_str(), "GPU" | "Both") {
-        if let Some(path) = app.kernels_path.clone() {
-          if !path.is_empty() && std::path::Path::new(&path).is_file() {
-            app.pending_kernel_autoload = Some(path);
-          } else if !path.is_empty() {
-            crate::app_log!("[SETTINGS] last_kernel_file not found: {path}");
-          }
+      if matches!(app.device.as_str(), "GPU" | "Both")
+        && let Some(path) = app.kernels_path.clone()
+      {
+        if !path.is_empty() && std::path::Path::new(&path).is_file() {
+          app.pending_kernel_autoload = Some(path);
+        } else if !path.is_empty() {
+          crate::app_log!("[SETTINGS] last_kernel_file not found: {path}");
         }
       }
     }
@@ -684,7 +694,7 @@ impl KeyHunterApp {
       png::ColorType::Rgb => {
         let rgb = &buf[..info.buffer_size()];
         let mut out = Vec::with_capacity((rgb.len() / 3) * 4);
-        for chunk in rgb.chunks_exact(3) {
+        for chunk in rgb.as_chunks::<3>().0 {
           out.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
         }
         out
@@ -702,9 +712,11 @@ impl KeyHunterApp {
       png::ColorType::GrayscaleAlpha => {
         let ga = &buf[..info.buffer_size()];
         let mut out = Vec::with_capacity((ga.len() / 2) * 4);
-        for chunk in ga.chunks_exact(2) {
+
+        for chunk in ga.as_chunks::<2>().0 {
           out.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
         }
+
         out
       }
 
@@ -1001,11 +1013,7 @@ impl KeyHunterApp {
     self.idle_solving = false;
     self.idle_minutes = 5;
 
-    if cfg!(feature = "next_release") {
-      self.tray_enabled = true;
-    } else {
-      self.tray_enabled = false;
-    }
+    self.tray_enabled = cfg!(feature = "next_release");
 
     self.selected_puzzle = DEFAULT_PUZZLE;
     self.all_turn_secs = ALL_MODE_DEFAULT_TURN_SECS;
@@ -1028,106 +1036,128 @@ impl KeyHunterApp {
   ) -> Result<(), String> {
     let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut map = std::collections::BTreeMap::new();
+
     for line in text.lines() {
       let line = line.trim();
       if line.is_empty() || line.starts_with('#') {
         continue;
       }
+
       if let Some((k, v)) = line.split_once('=') {
         map.insert(k.trim().to_string(), Self::conf_unquote(v.trim()));
       }
     }
+
     let get = |key: &str| map.get(key).map(|s| s.as_str());
 
-    if let Some(v) = get("device") {
-      if matches!(v, "CPU" | "GPU" | "Both") {
-        self.device = v.to_string();
-      }
+    if let Some(v) = get("device")
+      && matches!(v, "CPU" | "GPU" | "Both")
+    {
+      self.device = v.to_string();
     }
+
     if let Some(v) = get("mode") {
       self.solving_mode = match v.to_ascii_lowercase().as_str() {
         "pcg" => SearchMode::Pcg,
         _ => SearchMode::Sequence,
       };
     }
-    if let Some(v) = get("intensity") {
-      if let Ok(p) = v.parse::<u32>() {
-        let p = p.clamp(10, 100);
-        self.intensity = p as f32 / 100.0;
-        self.intensity_atomic.store(p, Ordering::Relaxed);
-      }
+
+    if let Some(v) = get("intensity")
+      && let Ok(p) = v.parse::<u32>()
+    {
+      let p = p.clamp(10, 100);
+      self.intensity = p as f32 / 100.0;
+      self.intensity_atomic.store(p, Ordering::Relaxed);
     }
+
     if let Some(v) = get("turbo") {
       let on = v == "1" || v.eq_ignore_ascii_case("true");
       self.intel_turbo = on;
       Self::set_intel_turbo(on);
     }
-    if let Some(v) = get("preferred_kernel") {
-      if let Some(ty) = KernelType::from_string(v).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == v)) {
-        self.kernel.kernel_type = ty;
-      }
+
+    if let Some(v) = get("preferred_kernel")
+      && let Some(ty) = KernelType::from_string(v).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == v))
+    {
+      self.kernel.kernel_type = ty;
     }
+
     if let Some(v) = get("size") {
       self.kernel.kernel_size = v.to_string();
     }
-    if let Some(v) = get("keys") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.parallel_keys = n.max(1);
-      }
+
+    if let Some(v) = get("keys")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.parallel_keys = n.max(1);
     }
+
     if let Some(v) = get("launch_mode") {
       self.launch_manual = v.eq_ignore_ascii_case("manual");
     }
-    if let Some(v) = get("block") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.block_size = n.max(1);
-      }
+
+    if let Some(v) = get("block")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.block_size = n.max(1);
     }
-    if let Some(v) = get("grid") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.grid_size = n.max(1);
-      }
+
+    if let Some(v) = get("grid")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.grid_size = n.max(1);
     }
-    if let Some(v) = get("chunk") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.chunk_multiplier = n.max(1);
-      }
+
+    if let Some(v) = get("chunk")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.chunk_multiplier = n.max(1);
     }
-    if let Some(v) = get("last_kernel_file") {
-      if !v.is_empty() {
-        self.kernels_path = Some(v.to_string());
-      }
+
+    if let Some(v) = get("last_kernel_file")
+      && !v.is_empty()
+    {
+      self.kernels_path = Some(v.to_string());
     }
+
     if let Some(v) = get("hide_on_close") {
       self.hide_on_close = v == "1" || v.eq_ignore_ascii_case("true");
+
       if let Some(item) = &self.tray_hide_item {
         item.set_checked(self.hide_on_close);
       }
     }
+
     if let Some(v) = get("idle_solving") {
       self.idle_solving = v == "1" || v.eq_ignore_ascii_case("true");
+
       if let Some(item) = &self.tray_idle_item {
         item.set_checked(self.idle_solving);
       }
     }
-    if let Some(v) = get("idle_minutes") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.idle_minutes = n.clamp(1, 60);
-      }
+
+    if let Some(v) = get("idle_minutes")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.idle_minutes = n.clamp(1, 60);
     }
+
     if let Some(v) = get("tray_enabled") {
       self.tray_enabled = v == "1" || v.eq_ignore_ascii_case("true");
     }
-    if let Some(v) = get("selected_puzzle") {
-      if let Ok(n) = v.parse::<u32>() {
-        self.selected_puzzle = n;
-      }
+
+    if let Some(v) = get("selected_puzzle")
+      && let Ok(n) = v.parse::<u32>()
+    {
+      self.selected_puzzle = n;
     }
-    if let Some(v) = get("all_turn_secs") {
-      if let Ok(n) = v.parse::<u64>() {
-        self.all_turn_secs = n;
-        self.all_turn_secs_atomic.store(n, Ordering::Relaxed);
-      }
+
+    if let Some(v) = get("all_turn_secs")
+      && let Ok(n) = v.parse::<u64>()
+    {
+      self.all_turn_secs = n;
+      self.all_turn_secs_atomic.store(n, Ordering::Relaxed);
     }
     self.ensure_tray_state();
     self.refresh_kernel();
@@ -1675,14 +1705,6 @@ impl KeyHunterApp {
     self.buy_product == DEMO_PRODUCT_ID
   }
 
-  fn license_email_subject(&self) -> &'static str {
-    if self.is_demo_product() {
-      LICENSE_REQUEST_SUBJECT_DEMO
-    } else {
-      LICENSE_REQUEST_SUBJECT_PRO
-    }
-  }
-
   pub fn open_buy_window(&mut self) {
     self.show_buy_window = true;
     self.buy_step = 0;
@@ -1738,40 +1760,113 @@ impl KeyHunterApp {
 
     self.buy_payload = crate::kernel::build_license_request_payload(&report, product, email, &coin, txid);
     self.buy_status = if self.buy_payload.contains("UNENCRYPTED") {
-      "Generated (gpg not available - payload is cleartext). Copy the block and send only to the route shown below.".to_string()
+      "Generated (gpg not available - payload is cleartext).".to_string()
     } else {
-      "Encrypted payload ready. Copy the block and send only to the route shown below.".to_string()
+      "Encrypted request ready. Please send it now.".to_string()
     };
+  }
+
+  fn poll_delivery_result(
+    &mut self,
+    ctx: &egui::Context,
+  ) {
+    if let Some(rx) = &self.delivery_receiver {
+      match rx.try_recv() {
+        Ok(Ok(())) => {
+          self.delivery_state = DeliveryState::Success;
+          self.buy_status = "Delivery request sent successfully.".to_string();
+
+          self.delivery_receiver = None;
+
+          ctx.request_repaint();
+        }
+
+        Ok(Err(err)) => {
+          self.delivery_state = DeliveryState::Failed(err.clone());
+
+          self.buy_status = format!("Delivery failed: {}", err);
+
+          self.delivery_receiver = None;
+
+          ctx.request_repaint();
+        }
+
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+
+        Err(_) => {
+          self.delivery_state = DeliveryState::Failed("Channel closed unexpectedly".into());
+
+          self.delivery_receiver = None;
+
+          ctx.request_repaint();
+        }
+      }
+    }
   }
 
   fn open_delivery_client(
     &mut self,
     ctx: &egui::Context,
-  ) {
+  ) -> Result<(), String> {
     if self.buy_payload.is_empty() {
-      self.buy_status = "Generate the payload first.".to_string();
-      return;
+      return Err("Generate the payload first.".to_string());
     }
 
-    let route = self.current_delivery_route();
-    ctx.copy_text(self.buy_payload.clone());
+    if self.delivery_receiver.is_some() {
+      return Err("Delivery already in progress.".to_string());
+    }
 
-    let body = self.buy_payload.clone();
-    let subject = self.license_email_subject();
+    let payload = self.buy_payload.clone();
+    let email_sender = self.buy_email.clone();
+    let endpoint = "https://ntfy.sh/PHP_6B7PCdcvPmaXcfYT";
+    let package = self.buy_product.clone();
 
-    let link = format!("mailto:{}?subject={}&body={}", route, url_encode(subject), url_encode(&body));
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    match open_mailto_url(&link) {
-      Ok(()) => {
-        self.buy_status = "Delivery client opened with the request filled in.".to_string();
-      }
-      Err(e) => {
-        self.buy_status = format!(
-          "Could not open delivery client ({}). Payload is on the clipboard - paste it and send only to the route shown above.",
-          e
+    rayon::spawn(move || {
+      let result = (|| -> Result<(), String> {
+        let client = reqwest::blocking::Client::builder()
+          .timeout(std::time::Duration::from_secs(20))
+          .build()
+          .map_err(|e| e.to_string())?;
+
+        let message = format!(
+          "New Puzzle Hunter Pro purchase\n\n\
+                 Customer Email: {}\n\n\
+                 {}",
+          email_sender, payload
         );
-      }
-    }
+
+        let response = client
+          .post(endpoint)
+          .header("Title", format!("New {} request", package))
+          .body(message)
+          .send()
+          .map_err(|e| e.to_string())?;
+
+        let status = response.status();
+        let body = response.text().map_err(|e| e.to_string())?;
+
+        println!("ntfy status: {}", status);
+        println!("ntfy response: {}", body);
+
+        if !status.is_success() {
+          return Err(format!("HTTP {}: {}", status, body));
+        }
+
+        Ok(())
+      })();
+
+      let _ = tx.send(result);
+    });
+
+    self.delivery_receiver = Some(rx);
+    self.delivery_state = DeliveryState::Sending;
+    self.buy_status = "Sending delivery request...".to_string();
+
+    ctx.request_repaint();
+
+    Ok(())
   }
 
   fn current_delivery_route(&self) -> String {
@@ -1788,6 +1883,8 @@ impl KeyHunterApp {
     }
 
     let mut open = true;
+    self.poll_delivery_result(ctx);
+
     egui::Window::new("Buy Kernels (F2)")
       .default_size([550.0, 550.0])
       .resizable(true)
@@ -2323,13 +2420,43 @@ Buying means you accept the product as-is and accept that any failure on your si
         ui.add_space(MARGIN_NARROW);
 
         ui.horizontal(|ui| {
-          if ui.button(egui::RichText::new("Generate payload").color(COL_ACCENT).strong()).clicked() {
+          if ui.button(egui::RichText::new("Generate request").color(COL_ACCENT).strong()).clicked() {
             self.generate_buy_payload();
           }
 
-          if !self.buy_payload.is_empty() && ui.button("Copy").clicked() {
-            ui.ctx().copy_text(self.buy_payload.clone());
-            self.buy_status = "Copied to clipboard".to_string();
+          if let DeliveryState::Failed(_) = &self.delivery_state {
+            ui.add_space(MARGIN_NARROW);
+
+            let route = self.current_delivery_route();
+
+            ui.label(
+              egui::RichText::new("Automatic delivery failed. Send the block manually:")
+                .color(COL_ACCENT)
+                .strong(),
+            );
+
+            ui.horizontal(|ui| {
+              ui.monospace(route.clone());
+
+              if ui.small_button("Copy route").clicked() {
+                ui.ctx().copy_text(route.clone());
+              }
+            });
+
+            let mut block = self.buy_payload.clone();
+
+            if !self.buy_payload.is_empty() && ui.button("Copy").clicked() {
+              ui.ctx().copy_text(self.buy_payload.clone());
+              self.buy_status = "Copied to clipboard".to_string();
+            }
+            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+              ui.add(
+                egui::TextEdit::multiline(&mut block)
+                  .font(egui::TextStyle::Monospace)
+                  .interactive(false)
+                  .desired_width(ui.available_width()),
+              );
+            });
           }
         });
 
@@ -2345,38 +2472,6 @@ Buying means you accept the product as-is and accept that any failure on your si
           };
           ui.label(egui::RichText::new(&self.buy_status).color(color));
         }
-
-        if !self.buy_payload.is_empty() {
-          ui.add_space(MARGIN_NARROW);
-          let route = self.current_delivery_route();
-          ui.label(
-            egui::RichText::new("Send only the block below to this route (machine-bound):")
-              .italics()
-              .color(egui::Color32::from_gray(180)),
-          );
-          ui.horizontal(|ui| {
-            ui.monospace(egui::RichText::new(&route).color(COL_ACCENT).strong());
-            if ui.small_button("Copy route").clicked() {
-              ui.ctx().copy_text(route.clone());
-              self.buy_status = "Route copied.".to_string();
-            }
-          });
-          ui.add_space(4.0);
-          let mut block = self.buy_payload.clone();
-          let payload_h = (ui.available_height() - 8.0).max(140.0);
-
-          egui::ScrollArea::vertical()
-            .max_height(payload_h)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-              ui.add(
-                egui::TextEdit::multiline(&mut block)
-                  .desired_width(ui.available_width())
-                  .font(egui::TextStyle::Monospace)
-                  .interactive(false),
-              );
-            });
-        }
       });
 
     ui.add_space(MARGIN_NARROW);
@@ -2387,14 +2482,63 @@ Buying means you accept the product as-is and accept that any failure on your si
       }
 
       ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        //   if ui
+        //     .add_enabled(
+        //       !self.buy_payload.is_empty(),
+        //       egui::Button::new(egui::RichText::new("Send request").strong().color(COL_GPU)),
+        //     )
+        //     .clicked()
+        //   {
+        //     self.open_delivery_client(ui.ctx());
+        //     // JUMP: Alternative buy request
+        //     // If no error returned then ok if error then create this elements:
+        //     //         if !self.buy_payload.is_empty() {
+        //     //           ui.add_space(MARGIN_NARROW);
+        //     //           let route = self.current_delivery_route();
+        //     //           ui.label(
+        //     //             egui::RichText::new("Send only the block below to this route (machine-bound):")
+        //     //               .italics()
+        //     //               .color(egui::Color32::from_gray(180)),
+        //     //           );
+        //     //           ui.horizontal(|ui| {
+        //     //             ui.monospace(egui::RichText::new(&route).color(COL_ACCENT).strong());
+        //     //             if ui.small_button("Copy route").clicked() {
+        //     //               ui.ctx().copy_text(route.clone());
+        //     //               self.buy_status = "Route copied.".to_string();
+        //     //             }
+        //     //           });
+        //     //           ui.add_space(4.0);
+        //     //           let mut block = self.buy_payload.clone();
+        //     //           let payload_h = (ui.available_height() - 8.0).max(140.0);
+        //     //
+        //     //           egui::ScrollArea::vertical()
+        //     //             .max_height(payload_h)
+        //     //             .auto_shrink([false, false])
+        //     //             .show(ui, |ui| {
+        //     //               ui.add(
+        //     //                 egui::TextEdit::multiline(&mut block)
+        //     //                   .desired_width(ui.available_width())
+        //     //                   .font(egui::TextStyle::Monospace)
+        //     //                   .interactive(false),
+        //     //               );
+        //     //             });
+        //     //         }
+        //     self.buy_step = 4;
+        //   }
+        //
+
         if ui
           .add_enabled(
             !self.buy_payload.is_empty(),
-            egui::Button::new(egui::RichText::new("Open delivery").strong().color(COL_GPU)),
+            egui::Button::new(egui::RichText::new("Send request").strong().color(COL_GPU)),
           )
           .clicked()
         {
-          self.open_delivery_client(ui.ctx());
+          if let Err(err) = self.open_delivery_client(ui.ctx()) {
+            self.buy_status = err.clone();
+            self.delivery_state = DeliveryState::Failed(err);
+          }
+
           self.buy_step = 4;
         }
       });
@@ -3283,11 +3427,12 @@ impl eframe::App for KeyHunterApp {
       }
     }
 
-    if let Some(path) = self.pending_kernel_autoload.take() {
-      if matches!(self.device.as_str(), "GPU" | "Both") && !self.kernels_loading {
-        crate::app_log!("[SETTINGS] Auto-loading kernel package: {path}");
-        self.begin_kernel_load(std::path::PathBuf::from(path), ui.ctx().clone());
-      }
+    if let Some(path) = self.pending_kernel_autoload.take()
+      && matches!(self.device.as_str(), "GPU" | "Both")
+      && !self.kernels_loading
+    {
+      crate::app_log!("[SETTINGS] Auto-loading kernel package: {path}");
+      self.begin_kernel_load(std::path::PathBuf::from(path), ui.ctx().clone());
     }
 
     self.poll_kernel_load();
@@ -4732,12 +4877,13 @@ impl KeyHunterApp {
               Ok(()) => {
                 self.settings_status = format!("Loaded {SETTINGS_FILE}");
                 crate::app_log!("[SETTINGS] Loaded {SETTINGS_FILE}");
-                if matches!(self.device.as_str(), "GPU" | "Both") {
-                  if let Some(path) = self.kernels_path.clone() {
-                    if !path.is_empty() && std::path::Path::new(&path).is_file() {
-                      self.pending_kernel_autoload = Some(path);
-                    }
-                  }
+
+                if matches!(self.device.as_str(), "GPU" | "Both")
+                  && let Some(path) = self.kernels_path.clone()
+                  && !path.is_empty()
+                  && std::path::Path::new(&path).is_file()
+                {
+                  self.pending_kernel_autoload = Some(path);
                 }
               }
               Err(e) => {
@@ -5196,14 +5342,14 @@ impl KeyHunterApp {
       .default_size([560.0, 520.0])
       .show(ctx, |ui| {
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          ui.horizontal(|ui| egui::RichText::new("Help").strong());
+          ui.horizontal(|_ui| egui::RichText::new("Help").strong());
 
           // JUMP: TODO help window
         });
       });
 
     if !open {
-      self.show_settings_window = false;
+      self.show_help_window = false;
     }
   }
 }
@@ -5248,48 +5394,48 @@ fn format_count(n: u64) -> String {
   }
 }
 
-fn url_encode(s: &str) -> String {
-  let mut out = String::with_capacity(s.len() * 3);
-  for b in s.bytes() {
-    match b {
-      b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-        out.push(b as char);
-      }
-      b' ' => out.push_str("%20"),
-      _ => out.push_str(&format!("%{:02X}", b)),
-    }
-  }
-  out
-}
+// fn url_encode(s: &str) -> String {
+//   let mut out = String::with_capacity(s.len() * 3);
+//   for b in s.bytes() {
+//     match b {
+//       b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+//         out.push(b as char);
+//       }
+//       b' ' => out.push_str("%20"),
+//       _ => out.push_str(&format!("%{:02X}", b)),
+//     }
+//   }
+//   out
+// }
 
-fn open_mailto_url(mailto: &str) -> Result<(), String> {
-  #[cfg(target_os = "windows")]
-  {
-    Command::new("cmd").args(["/C", "start", "", mailto]).spawn().map_err(|e| e.to_string())?;
-    return Ok(());
-  }
-
-  #[cfg(target_os = "macos")]
-  {
-    Command::new("open").arg(mailto).spawn().map_err(|e| e.to_string())?;
-    return Ok(());
-  }
-
-  #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-  {
-    if Command::new("xdg-email").arg("--version").output().is_ok() {
-      let _ = Command::new("xdg-open").arg(mailto).spawn();
-      return Ok(());
-    }
-
-    if Command::new("xdg-open").arg(mailto).spawn().is_ok() {
-      return Ok(());
-    }
-
-    if Command::new("gio").args(["open", mailto]).spawn().is_ok() {
-      return Ok(());
-    }
-
-    Err("No mailto handler found (tried xdg-open / gio)".into())
-  }
-}
+// fn open_mailto_url(mailto: &str) -> Result<(), String> {
+//   #[cfg(target_os = "windows")]
+//   {
+//     Command::new("cmd").args(["/C", "start", "", mailto]).spawn().map_err(|e| e.to_string())?;
+//     return Ok(());
+//   }
+//
+//   #[cfg(target_os = "macos")]
+//   {
+//     Command::new("open").arg(mailto).spawn().map_err(|e| e.to_string())?;
+//     return Ok(());
+//   }
+//
+//   #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+//   {
+//     if Command::new("xdg-email").arg("--version").output().is_ok() {
+//       let _ = Command::new("xdg-open").arg(mailto).spawn();
+//       return Ok(());
+//     }
+//
+//     if Command::new("xdg-open").arg(mailto).spawn().is_ok() {
+//       return Ok(());
+//     }
+//
+//     if Command::new("gio").args(["open", mailto]).spawn().is_ok() {
+//       return Ok(());
+//     }
+//
+//     Err("No mailto handler found (tried xdg-open / gio)".into())
+//   }
+// }
