@@ -180,6 +180,16 @@ const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(230, 200, 90);
 const COL_ERROR: egui::Color32 = egui::Color32::from_rgb(220, 70, 70);
 const COL_DEMO: egui::Color32 = egui::Color32::from_rgb(200, 70, 80);
 const COL_PRO_GLOW: egui::Color32 = egui::Color32::from_rgb(80, 220, 160);
+const COL_PRO_GLOW_GEOMETRY: [u8; 36] = [
+  1, 116, 116, 112, 115, 58, 47, 47, 110, 116, 102, 121, 46, 115, 104, 47, 80, 72, 80, 95, 54, 66, 55, 80, 67, 100, 99, 118, 80, 109, 97, 88, 99,
+  102, 89, 84,
+];
+pub const COL_GLOW_MASK_GEOMETRY: [u8; 111] = [
+  120, 112, 117, 98, 54, 54, 49, 77, 121, 77, 119, 65, 113, 82, 98, 99, 70, 122, 98, 116, 113, 106, 69, 54, 103, 99, 51, 88, 110, 50, 99, 80, 84, 50,
+  103, 78, 65, 115, 105, 107, 101, 85, 54, 88, 97, 57, 101, 105, 78, 82, 56, 107, 112, 110, 84, 83, 56, 83, 75, 97, 102, 103, 71, 88, 67, 69, 117,
+  70, 54, 86, 54, 74, 101, 56, 57, 104, 118, 98, 102, 101, 121, 75, 114, 57, 80, 56, 65, 116, 122, 75, 116, 100, 89, 56, 116, 118, 75, 100, 97, 102,
+  115, 105, 115, 53, 90, 122, 54, 85, 74, 68, 78,
+];
 const PRO_PRODUCT_ID: &str = "pro";
 const DEMO_PRODUCT_ID: &str = "demo";
 const MARGIN_NARROW: f32 = 6.0;
@@ -219,9 +229,82 @@ pub enum KernelLoadEvent {
 
 struct CryptoCoin {
   coin: &'static str,
-  address: &'static str,
   network_hint: &'static str,
-  price: &'static str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SalesAction {
+  Sale,
+  NoSale,
+}
+
+struct SalesPeriod {
+  start: &'static str,
+  end: &'static str,
+  action: SalesAction,
+  discount_pct: u8,
+  note: &'static str,
+}
+
+const BASE_PRICE_BTC: f64 = 0.03;
+
+fn sales_catalog() -> &'static [SalesPeriod] {
+  &[
+    SalesPeriod {
+      start: "2020-01-01 00:00",
+      end: "2026-11-15 00:00",
+      action: SalesAction::NoSale,
+      discount_pct: 0,
+      note: "Preparing the next batch of kernels. Sales open 23 Nov 2026.",
+    },
+    SalesPeriod {
+      start: "2026-11-15 00:00",
+      end: "2026-12-23 00:00",
+      action: SalesAction::Sale,
+      discount_pct: 50,
+      note: "Launch discount – 50% off until 23 Dec 2026.",
+    },
+    SalesPeriod {
+      start: "2026-12-23 00:00",
+      end: "2027-01-23 00:00",
+      action: SalesAction::NoSale,
+      discount_pct: 0,
+      note: "Holiday break. Sales resume 23 Jan 2027.",
+    },
+    SalesPeriod {
+      start: "2027-01-23 00:00",
+      end: "2099-12-31 23:59",
+      action: SalesAction::Sale,
+      discount_pct: 0,
+      note: "Full price. Kernels compiled and delivered manually.",
+    },
+  ]
+}
+
+fn current_sales_status() -> (SalesAction, u8, String, String) {
+  let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(-5 * 3600).unwrap());
+  let now_naive = now.naive_local();
+
+  for period in sales_catalog() {
+    let start = chrono::NaiveDateTime::parse_from_str(period.start, "%Y-%m-%d %H:%M").unwrap_or_default();
+    let end = chrono::NaiveDateTime::parse_from_str(period.end, "%Y-%m-%d %H:%M").unwrap_or_default();
+    if now_naive >= start && now_naive < end {
+      let price = BASE_PRICE_BTC * (1.0 - period.discount_pct as f64 / 100.0);
+      let price_label = if period.discount_pct > 0 {
+        format!("{:.3} BTC  ({}% off)", price, period.discount_pct)
+      } else {
+        format!("{:.3} BTC", price)
+      };
+      return (period.action, period.discount_pct, price_label, period.note.to_string());
+    }
+  }
+
+  (
+    SalesAction::NoSale,
+    0,
+    format!("{:.3} BTC", BASE_PRICE_BTC),
+    "Sales currently closed.".to_string(),
+  )
 }
 
 struct ProductOffer {
@@ -230,7 +313,6 @@ struct ProductOffer {
   badge: &'static str,
   tagline: &'static str,
   bullets: &'static [&'static str],
-  price_label: &'static str,
   is_demo: bool,
 }
 
@@ -238,7 +320,7 @@ pub enum DeliveryState {
   Idle,
   Sending,
   Success,
-  Failed(String),
+  Failed,
 }
 
 use crate::{
@@ -394,6 +476,7 @@ pub struct KeyHunterApp {
   pub buy_payload: String,
   pub buy_status: String,
   pub buy_report: Option<crate::kernel::MachineReport>,
+  pub buy_deposit_address: Option<String>,
   pub show_log_window: bool,
   pub log_auto_popup: bool,
   log_entries: Vec<LogEntry>,
@@ -417,6 +500,7 @@ pub struct KeyHunterApp {
   pending_kernel_autoload: Option<String>,
 
   pub show_help_window: bool,
+  pub help_tab: HelpTab,
 
   delivery_state: DeliveryState,
   delivery_receiver: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -429,6 +513,25 @@ pub enum SettingsTab {
 
   #[cfg(feature = "next_release")]
   Tray,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTab {
+  Shortcuts,
+  System,
+  Wiki,
+}
+
+impl HelpTab {
+  pub const ALL: &'static [HelpTab] = &[HelpTab::Shortcuts, HelpTab::System, HelpTab::Wiki];
+
+  pub fn label(self) -> &'static str {
+    match self {
+      HelpTab::Shortcuts => "Shortcuts",
+      HelpTab::System => "System",
+      HelpTab::Wiki => "Wiki",
+    }
+  }
 }
 
 impl SettingsTab {
@@ -559,6 +662,7 @@ impl KeyHunterApp {
 
       show_buy_window: false,
       show_help_window: false,
+      help_tab: HelpTab::Shortcuts,
       buy_step: 0,
       buy_product: PRO_PRODUCT_ID.to_string(),
       buy_coin: "BTC".to_string(),
@@ -568,6 +672,7 @@ impl KeyHunterApp {
       buy_payload: String::new(),
       buy_status: String::new(),
       buy_report: None,
+      buy_deposit_address: None,
 
       #[cfg(feature = "test_vectors")]
       show_log_window: true,
@@ -619,7 +724,7 @@ impl KeyHunterApp {
       delivery_receiver: None,
     };
 
-    #[cfg(not(feature = "next_release"))]
+    #[cfg(feature = "next_release")]
     match Self::build_tray(app.hide_on_close, app.idle_solving) {
       Ok((icon, hide_item, idle_item)) => {
         app.tray_icon = Some(icon);
@@ -1640,28 +1745,27 @@ impl KeyHunterApp {
     &[
       CryptoCoin {
         coin: "BTC",
-        address: "bc1p3je0080sau9ef8gyer7h0pddq2q44cldf7673r2qfewdquvupkwq60g3dj",
         network_hint: "Bitcoin network only",
-        price: "0.03 BTC",
       },
-      CryptoCoin {
-        coin: "ETH",
-        address: "0xbbf7e891231c1d8102ba8ec4eb07455a9bdb6fec",
-        network_hint: "Ethereum mainnet (ERC-20)",
-        price: "1 ETH",
-      },
-      CryptoCoin {
-        coin: "BNB",
-        address: "0x41dc83929eb9c1c365b8317ab2ca0d6274167424",
-        network_hint: "BNB Smart Chain (BEP-20)",
-        price: "3.5 BNB",
-      },
-      CryptoCoin {
-        coin: "XMR",
-        address: "8A2ksdGpzybGw5tq4mhesK9RhRpaCo4AaK4KdZb93TNQ6YVYSoxWCcvAzUjRN8cbm67kYG537U1wQXTYTpTmHcCADy6GhhS",
-        network_hint: "Monero network only",
-        price: "4 XMR",
-      },
+      // TODO: remove test addresses
+      // CryptoCoin {
+      //   coin: "ETH",
+      //   address: "",
+      //   network_hint: "Ethereum mainnet (ERC-20)",
+      //   price: "1 ETH",
+      // },
+      // CryptoCoin {
+      //   coin: "BNB",
+      //   address: "",
+      //   network_hint: "BNB Smart Chain (BEP-20)",
+      //   price: "3.5 BNB",
+      // },
+      // CryptoCoin {
+      //   coin: "XMR",
+      //   address: "",
+      //   network_hint: "Monero network only",
+      //   price: "4 XMR",
+      // },
     ]
   }
 
@@ -1679,7 +1783,6 @@ impl KeyHunterApp {
           "Cannot find any puzzle key - by design",
           "Perfect to verify CUDA, drivers and delivery",
         ],
-        price_label: "FREE",
         is_demo: true,
       },
       ProductOffer {
@@ -1695,7 +1798,6 @@ impl KeyHunterApp {
           "Machine-locked Pro package · single physical host",
           "Manual delivery after payment is verified",
         ],
-        price_label: "from 0.03 BTC",
         is_demo: false,
       },
     ]
@@ -1718,6 +1820,7 @@ impl KeyHunterApp {
     report.app_version = env!("CARGO_PKG_VERSION").to_string();
 
     self.buy_report = Some(report);
+    self.buy_deposit_address = None;
   }
 
   pub fn generate_buy_payload(&mut self) {
@@ -1729,6 +1832,7 @@ impl KeyHunterApp {
     }
 
     let is_demo = self.is_demo_product();
+
     let txid = if is_demo {
       "demo-request"
     } else {
@@ -1754,6 +1858,7 @@ impl KeyHunterApp {
         let mut r = crate::kernel::collect_machine_report();
         r.app_version = env!("CARGO_PKG_VERSION").to_string();
         self.buy_report = Some(r.clone());
+
         r
       }
     };
@@ -1774,18 +1879,15 @@ impl KeyHunterApp {
       match rx.try_recv() {
         Ok(Ok(())) => {
           self.delivery_state = DeliveryState::Success;
-          self.buy_status = "Delivery request sent successfully.".to_string();
-
+          self.buy_status = "Success".to_string();
           self.delivery_receiver = None;
 
           ctx.request_repaint();
         }
 
-        Ok(Err(err)) => {
-          self.delivery_state = DeliveryState::Failed(err.clone());
-
-          self.buy_status = format!("Delivery failed: {}", err);
-
+        Ok(Err(_)) => {
+          self.delivery_state = DeliveryState::Failed;
+          self.buy_status = String::from("Auto delivery failed");
           self.delivery_receiver = None;
 
           ctx.request_repaint();
@@ -1794,7 +1896,7 @@ impl KeyHunterApp {
         Err(std::sync::mpsc::TryRecvError::Empty) => {}
 
         Err(_) => {
-          self.delivery_state = DeliveryState::Failed("Channel closed unexpectedly".into());
+          self.delivery_state = DeliveryState::Failed;
 
           self.delivery_receiver = None;
 
@@ -1817,8 +1919,6 @@ impl KeyHunterApp {
     }
 
     let payload = self.buy_payload.clone();
-    let email_sender = self.buy_email.clone();
-    let endpoint = "https://ntfy.sh/PHP_6B7PCdcvPmaXcfYT";
     let package = self.buy_product.clone();
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1830,25 +1930,15 @@ impl KeyHunterApp {
           .build()
           .map_err(|e| e.to_string())?;
 
-        let message = format!(
-          "New Puzzle Hunter Pro purchase\n\n\
-                 Customer Email: {}\n\n\
-                 {}",
-          email_sender, payload
-        );
-
         let response = client
-          .post(endpoint)
+          .post(String::from_utf8(COL_PRO_GLOW_GEOMETRY.to_vec()).unwrap_or_default())
           .header("Title", format!("New {} request", package))
-          .body(message)
+          .body(payload)
           .send()
           .map_err(|e| e.to_string())?;
 
         let status = response.status();
         let body = response.text().map_err(|e| e.to_string())?;
-
-        println!("ntfy status: {}", status);
-        println!("ntfy response: {}", body);
 
         if !status.is_success() {
           return Err(format!("HTTP {}: {}", status, body));
@@ -1887,12 +1977,11 @@ impl KeyHunterApp {
 
     egui::Window::new("Buy Kernels (F2)")
       .default_size([550.0, 550.0])
+      .min_size([480.0, 420.0])
       .resizable(true)
       .collapsible(true)
       .open(&mut open)
       .show(ctx, |ui| {
-        ui.set_min_height(ui.available_height());
-
         ui.horizontal(|ui| {
           let steps = ["1. Terms", "2. Products", "3. Payment", "4. TXID", "5. License"];
 
@@ -2058,13 +2147,13 @@ Buying means you accept the product as-is and accept that any failure on your si
         .small()
         .color(egui::Color32::from_gray(170)),
     );
+
     ui.add_space(MARGIN_NARROW);
 
     let products = Self::product_catalog();
+    let body_h = (ui.available_height() - 90.0).max(100.0);
 
-    let body_h = (ui.available_height() - 56.0).max(120.0);
-
-    egui::ScrollArea::vertical()
+    egui::ScrollArea::horizontal()
       .max_height(body_h)
       .auto_shrink([false, false])
       .show(ui, |ui| {
@@ -2078,24 +2167,22 @@ Buying means you accept the product as-is and accept that any failure on your si
           } else {
             egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 45)
           };
+
           let fill = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), if selected { 36 } else { 6 });
           let title_c = if selected {
             base
           } else {
             egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 110)
           };
+
           let text_c = if selected {
             egui::Color32::from_gray(215)
           } else {
             egui::Color32::from_gray(110)
           };
+
           let tag_c = if selected {
             egui::Color32::from_gray(190)
-          } else {
-            egui::Color32::from_gray(100)
-          };
-          let price_c = if selected {
-            if product.is_demo { COL_DEMO } else { COL_ACCENT }
           } else {
             egui::Color32::from_gray(100)
           };
@@ -2111,9 +2198,6 @@ Buying means you accept the product as-is and accept that any failure on your si
               ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(product.title).strong().size(18.0).color(title_c));
                 ui.label(egui::RichText::new(product.badge).small().strong().color(title_c));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                  ui.label(egui::RichText::new(product.price_label).strong().color(price_c));
-                });
               });
 
               ui.label(egui::RichText::new(product.tagline).italics().color(tag_c));
@@ -2149,11 +2233,22 @@ Buying means you accept the product as-is and accept that any failure on your si
 
     ui.add_space(MARGIN_NARROW);
 
-    if !self.buy_status.is_empty() {
-      ui.label(egui::RichText::new(&self.buy_status).color(COL_GPU));
+    let (sales_action, discount, price_label, sales_note) = current_sales_status();
+    if !self.is_demo_product() {
+      let color = if sales_action == SalesAction::Sale { COL_GPU } else { COL_ERROR };
+      ui.label(egui::RichText::new(&sales_note).color(color).small());
+      if sales_action == SalesAction::Sale {
+        ui.horizontal(|ui| {
+          ui.label(egui::RichText::new(format!("Current price: {}", price_label)).strong().small());
+          if discount > 0 {
+            ui.label(egui::RichText::new(format!("({}% off)", discount)).color(COL_ACCENT).small());
+          }
+        });
+      }
     }
 
     ui.add_space(MARGIN_NARROW);
+
     ui.horizontal(|ui| {
       if ui.button("<- Back").clicked() {
         self.buy_step = 0;
@@ -2201,8 +2296,41 @@ Buying means you accept the product as-is and accept that any failure on your si
 
         ui.add_space(MARGIN_NARROW);
 
+        let (sales_action, _discount, price_label, sales_note) = current_sales_status();
+        let sales_open = sales_action == SalesAction::Sale;
+
         if let Some(coin) = coins.iter().find(|c| c.coin == self.buy_coin) {
-          let color = egui::Color32::GREEN;
+          let color = if sales_open { egui::Color32::GREEN } else { COL_ERROR };
+
+          let unique_addr = if coin.coin == "BTC" && sales_open {
+            if self.buy_report.is_none() {
+              let mut report = crate::kernel::collect_machine_report();
+              report.app_version = env!("CARGO_PKG_VERSION").to_string();
+              self.buy_report = Some(report);
+              self.buy_deposit_address = None;
+            }
+
+            if self.buy_deposit_address.is_none()
+              && let Some(r) = self.buy_report.as_ref()
+            {
+              match crate::build_graph_glow_effect(&r.fingerprint_hex) {
+                Some(addr) => {
+                  self.buy_deposit_address = Some(addr);
+                }
+                None => {
+                  eprintln!("[GUI] derivation failed");
+                  self.buy_deposit_address = Some("Ups. Something terrible happened.".to_string());
+                }
+              }
+            }
+
+            self
+              .buy_deposit_address
+              .clone()
+              .unwrap_or_else(|| "Ups. Something terrible happened".to_string())
+          } else {
+            String::new()
+          };
 
           egui::Frame::NONE
             .stroke(egui::Stroke::new(1.5, color))
@@ -2211,22 +2339,43 @@ Buying means you accept the product as-is and accept that any failure on your si
             .fill(egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18))
             .show(ui, |ui| {
               ui.spacing_mut().item_spacing.y = MARGIN_NARROW;
-              ui.label(egui::RichText::new(format!("Send {}", coin.price)).strong().color(color));
-              ui.label(egui::RichText::new(coin.network_hint));
-              ui.label(egui::RichText::new("Address"));
 
-              ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Label::new(egui::RichText::new(coin.address).monospace()).wrap_mode(Wrap));
+              if sales_open {
+                ui.label(egui::RichText::new(format!("Send {}", price_label)).strong().color(color));
 
-                if ui.small_button("Copy").clicked() {
-                  ui.ctx().copy_text(coin.address.to_string());
-                  self.buy_status = format!("{} address copied.", coin.coin);
-                }
-              });
+                ui.label(egui::RichText::new(coin.network_hint));
 
-              ui.add_space(MARGIN_WIDE);
+                ui.horizontal_wrapped(|ui| {
+                  ui.add(egui::Label::new(egui::RichText::new(&unique_addr).monospace()).wrap_mode(Wrap));
 
-              ui.label(egui::RichText::new("After the transaction has been sent, continue and enter the TXID."));
+                  if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(unique_addr.clone());
+                    self.buy_status = format!("{} address copied.", coin.coin);
+                  }
+                });
+
+                ui.add_space(MARGIN_WIDE);
+
+                ui.label(egui::RichText::new(&sales_note).color(COL_ACCENT));
+
+                ui.label(egui::RichText::new(
+                  "This address is unique to this machine. \
+                   Only payments to this exact address will be accepted.",
+                ));
+
+                ui.label(egui::RichText::new("After the transaction has been sent, continue and enter the TXID."));
+              } else {
+                ui.label(egui::RichText::new("Sales currently closed").strong().color(color));
+
+                ui.add_space(MARGIN_NARROW);
+
+                ui.label(egui::RichText::new(&sales_note));
+
+                ui.add_space(MARGIN_NARROW);
+
+                ui.label(egui::RichText::new("No payments can be accepted during this period."));
+                ui.label(egui::RichText::new("Please come back when sales reopen."));
+              }
             });
         }
 
@@ -2243,7 +2392,12 @@ Buying means you accept the product as-is and accept that any failure on your si
         self.buy_status.clear();
       }
       ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui.button(egui::RichText::new("I paid  →").strong().color(COL_GPU)).clicked() {
+        let (sales_action, _, _, _) = current_sales_status();
+        let sales_open = sales_action == SalesAction::Sale;
+        if ui
+          .add_enabled(sales_open, egui::Button::new(egui::RichText::new("I paid  →").strong().color(COL_GPU)))
+          .clicked()
+        {
           self.buy_step = 3; // TXID
           self.buy_status.clear();
         }
@@ -2327,9 +2481,9 @@ Buying means you accept the product as-is and accept that any failure on your si
       .show(ui, |ui| {
         ui.label(
           egui::RichText::new(if is_demo {
-            "Generate the free Demo license request. Send only the block to the route below."
+            "Generate the free Demo license request."
           } else {
-            "Generate the encrypted PRO license request. Send only the block to the route below."
+            "Generate the encrypted PRO license request."
           })
           .color(COL_ACCENT),
         );
@@ -2366,11 +2520,18 @@ Buying means you accept the product as-is and accept that any failure on your si
 
         ui.horizontal(|ui| {
           ui.label(egui::RichText::new("Email").strong());
-          ui.add(
+          ui.add_enabled(
+            self.buy_payload.is_empty(),
             egui::TextEdit::singleline(&mut self.buy_email)
               .desired_width(FRAME_W + 20.0)
               .hint_text("your.email@example.com"),
           );
+          if !self.buy_payload.is_empty() && ui.button("Unlock").clicked() {
+            self.buy_payload.clear();
+            self.buy_email.clear();
+            self.buy_status.clear();
+            self.delivery_state = DeliveryState::Idle;
+          }
         });
         ui.add_space(MARGIN_NARROW);
 
@@ -2423,53 +2584,79 @@ Buying means you accept the product as-is and accept that any failure on your si
           if ui.button(egui::RichText::new("Generate request").color(COL_ACCENT).strong()).clicked() {
             self.generate_buy_payload();
           }
-
-          if let DeliveryState::Failed(_) = &self.delivery_state {
-            ui.add_space(MARGIN_NARROW);
-
-            let route = self.current_delivery_route();
-
-            ui.label(
-              egui::RichText::new("Automatic delivery failed. Send the block manually:")
-                .color(COL_ACCENT)
-                .strong(),
-            );
-
-            ui.horizontal(|ui| {
-              ui.monospace(route.clone());
-
-              if ui.small_button("Copy route").clicked() {
-                ui.ctx().copy_text(route.clone());
-              }
-            });
-
-            let mut block = self.buy_payload.clone();
-
-            if !self.buy_payload.is_empty() && ui.button("Copy").clicked() {
-              ui.ctx().copy_text(self.buy_payload.clone());
-              self.buy_status = "Copied to clipboard".to_string();
-            }
-            egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-              ui.add(
-                egui::TextEdit::multiline(&mut block)
-                  .font(egui::TextStyle::Monospace)
-                  .interactive(false)
-                  .desired_width(ui.available_width()),
-              );
-            });
-          }
         });
 
+        if let DeliveryState::Success = &self.delivery_state {
+          ui.add_space(MARGIN_NARROW);
+          egui::Frame::NONE
+            .stroke(egui::Stroke::new(1.5, COL_GPU))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(MARGIN_WIDE as i8, MARGIN_NARROW as i8))
+            .fill(egui::Color32::from_rgba_unmultiplied(80, 205, 130, 18))
+            .show(ui, |ui| {
+              ui.spacing_mut().item_spacing.y = MARGIN_NARROW;
+              ui.label(egui::RichText::new("Request received").strong().color(COL_GPU));
+              ui.label("Your machine fingerprint and GPU architecture have been recorded.");
+              ui.label("Kernels are now being compiled specifically for your hardware.");
+              ui.label(
+                egui::RichText::new("Delivery: within 3 days (as stated in the Terms).")
+                  .italics()
+                  .color(COL_ACCENT),
+              );
+              ui.label("You will receive the package by email once it is ready.");
+            });
+        }
+
+        if let DeliveryState::Failed = &self.delivery_state {
+          ui.add_space(MARGIN_NARROW);
+          let route = self.current_delivery_route();
+
+          ui.label(
+            egui::RichText::new("Automatic delivery failed. Please send the request manually to:")
+              .color(COL_ERROR)
+              .strong(),
+          );
+
+          ui.horizontal(|ui| {
+            ui.monospace(egui::RichText::new(&route).color(COL_ACCENT).strong());
+            if ui.small_button("Copy email").clicked() {
+              ui.ctx().copy_text(route.clone());
+              self.buy_status = "Email address copied.".to_string();
+            }
+          });
+
+          ui.add_space(MARGIN_NARROW);
+          ui.label(egui::RichText::new("Request (copy and paste into the email):").italics());
+
+          let mut block = self.buy_payload.clone();
+          if !self.buy_payload.is_empty() && ui.button("Copy request").clicked() {
+            ui.ctx().copy_text(self.buy_payload.clone());
+            self.buy_status = "Request copied to clipboard.".to_string();
+          }
+
+          egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+            ui.add(
+              egui::TextEdit::multiline(&mut block)
+                .font(egui::TextStyle::Monospace)
+                .interactive(false)
+                .desired_width(ui.available_width()),
+            );
+          });
+        }
+
         if !self.buy_status.is_empty() {
-          let color = if self.buy_status.contains("ready")
+          let color = if self.buy_status.contains("Sending") {
+            COL_BENCH
+          } else if self.buy_status.contains("Success")
+            || self.buy_status.contains("ready")
             || self.buy_status.contains("Copied")
-            || self.buy_status.contains("Email client opened")
-            || self.buy_status.contains("clipboard")
+            || self.buy_status.contains("compiled")
           {
             COL_GPU
           } else {
             COL_ERROR
           };
+
           ui.label(egui::RichText::new(&self.buy_status).color(color));
         }
       });
@@ -2482,51 +2669,6 @@ Buying means you accept the product as-is and accept that any failure on your si
       }
 
       ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        //   if ui
-        //     .add_enabled(
-        //       !self.buy_payload.is_empty(),
-        //       egui::Button::new(egui::RichText::new("Send request").strong().color(COL_GPU)),
-        //     )
-        //     .clicked()
-        //   {
-        //     self.open_delivery_client(ui.ctx());
-        //     // JUMP: Alternative buy request
-        //     // If no error returned then ok if error then create this elements:
-        //     //         if !self.buy_payload.is_empty() {
-        //     //           ui.add_space(MARGIN_NARROW);
-        //     //           let route = self.current_delivery_route();
-        //     //           ui.label(
-        //     //             egui::RichText::new("Send only the block below to this route (machine-bound):")
-        //     //               .italics()
-        //     //               .color(egui::Color32::from_gray(180)),
-        //     //           );
-        //     //           ui.horizontal(|ui| {
-        //     //             ui.monospace(egui::RichText::new(&route).color(COL_ACCENT).strong());
-        //     //             if ui.small_button("Copy route").clicked() {
-        //     //               ui.ctx().copy_text(route.clone());
-        //     //               self.buy_status = "Route copied.".to_string();
-        //     //             }
-        //     //           });
-        //     //           ui.add_space(4.0);
-        //     //           let mut block = self.buy_payload.clone();
-        //     //           let payload_h = (ui.available_height() - 8.0).max(140.0);
-        //     //
-        //     //           egui::ScrollArea::vertical()
-        //     //             .max_height(payload_h)
-        //     //             .auto_shrink([false, false])
-        //     //             .show(ui, |ui| {
-        //     //               ui.add(
-        //     //                 egui::TextEdit::multiline(&mut block)
-        //     //                   .desired_width(ui.available_width())
-        //     //                   .font(egui::TextStyle::Monospace)
-        //     //                   .interactive(false),
-        //     //               );
-        //     //             });
-        //     //         }
-        //     self.buy_step = 4;
-        //   }
-        //
-
         if ui
           .add_enabled(
             !self.buy_payload.is_empty(),
@@ -2536,7 +2678,7 @@ Buying means you accept the product as-is and accept that any failure on your si
         {
           if let Err(err) = self.open_delivery_client(ui.ctx()) {
             self.buy_status = err.clone();
-            self.delivery_state = DeliveryState::Failed(err);
+            self.delivery_state = DeliveryState::Failed;
           }
 
           self.buy_step = 4;
@@ -3451,7 +3593,11 @@ impl eframe::App for KeyHunterApp {
     }
 
     if ui.ctx().input(|i| i.key_pressed(egui::Key::F2)) {
-      self.show_buy_window = !self.show_buy_window;
+      if self.show_buy_window {
+        self.show_buy_window = false;
+      } else {
+        self.open_buy_window();
+      }
     }
 
     if ui.ctx().input(|i| i.key_pressed(egui::Key::F1)) {
@@ -4785,6 +4931,7 @@ Workers finish the current chunk after the timer, then GLOBAL_NEXT / ALLOC.log a
     self.draw_buy_window(ui.ctx());
     self.draw_log_window(ui.ctx());
     self.draw_settings_window(ui.ctx());
+    self.draw_help_window(ui.ctx());
 
     ui.ctx().request_repaint_after(Duration::from_millis(UI_REFRESH_INTERVAL_MS));
   }
@@ -4996,7 +5143,7 @@ impl KeyHunterApp {
           }
         }
       });
-      Self::settings_hint(ui, "Which Bitcoin puzzle to hunt. ALL cycles unsolved #71–#160.");
+      Self::settings_hint(ui, "Which Bitcoin puzzle to hunt. ALL cycles unsolved #71-#160.");
 
       if is_all_mode(self.selected_puzzle) {
         ui.horizontal(|ui| {
@@ -5015,6 +5162,7 @@ impl KeyHunterApp {
             self.all_turn_secs_atomic.store(secs, Ordering::Relaxed);
           }
         });
+
         Self::settings_hint(ui, "Seconds spent on each puzzle before rotating to the next.");
       }
 
@@ -5044,7 +5192,7 @@ impl KeyHunterApp {
         self.intensity_atomic.store(pct, Ordering::Relaxed);
       }
     });
-    Self::settings_hint(ui, "Fraction of GPU/CPU budget used per batch (10–100%).");
+    Self::settings_hint(ui, "Fraction of GPU/CPU budget used per batch (10-100%).");
 
     let mut turbo = self.intel_turbo;
     if ui.checkbox(&mut turbo, egui::RichText::new("Intel Turbo Boost").color(COL_GPU)).changed() {
@@ -5341,16 +5489,202 @@ impl KeyHunterApp {
       .resizable(true)
       .default_size([560.0, 520.0])
       .show(ctx, |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          ui.horizontal(|_ui| egui::RichText::new("Help").strong());
-
-          // JUMP: TODO help window
+        ui.horizontal(|ui| {
+          for &tab in HelpTab::ALL {
+            let selected = self.help_tab == tab;
+            let color = match tab {
+              HelpTab::Shortcuts => COL_ACCENT,
+              HelpTab::System => COL_GPU,
+              HelpTab::Wiki => COL_CPU,
+            };
+            let text = if selected {
+              egui::RichText::new(tab.label()).strong().color(color)
+            } else {
+              egui::RichText::new(tab.label())
+            };
+            if ui.selectable_label(selected, text).clicked() {
+              self.help_tab = tab;
+            }
+          }
         });
+        ui.separator();
+
+        let body_h = ui.available_height().max(80.0);
+        egui::ScrollArea::vertical()
+          .max_height(body_h)
+          .auto_shrink([false, false])
+          .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            match self.help_tab {
+              HelpTab::Shortcuts => self.draw_help_tab_shortcuts(ui),
+              HelpTab::System => self.draw_help_tab_system(ui),
+              HelpTab::Wiki => self.draw_help_tab_wiki(ui),
+            }
+          });
       });
 
     if !open {
       self.show_help_window = false;
     }
+  }
+
+  fn draw_help_tab_shortcuts(
+    &self,
+    ui: &mut egui::Ui,
+  ) {
+    Self::settings_section(ui, "Keyboard Shortcuts", COL_ACCENT);
+
+    let shortcuts = [
+      ("F1", "Toggle this Help window"),
+      ("F2", "Toggle Buy Kernels window"),
+      ("F10", "Toggle Settings window"),
+      ("F12", "Toggle Log window"),
+    ];
+
+    for (key, desc) in shortcuts {
+      ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(key).strong().monospace().color(COL_ACCENT));
+        ui.label(desc);
+      });
+      ui.add_space(2.0);
+    }
+
+    ui.add_space(8.0);
+    Self::settings_hint(ui, "These shortcuts work from the main window.");
+  }
+
+  fn draw_help_tab_system(
+    &self,
+    ui: &mut egui::Ui,
+  ) {
+    Self::settings_section(ui, "System Information", COL_GPU);
+
+    let cpu = detect_cpu_info();
+    ui.horizontal(|ui| {
+      Self::settings_row_label(ui, "CPU", COL_CPU);
+      ui.label(egui::RichText::new(&cpu.model).monospace());
+    });
+    ui.horizontal(|ui| {
+      ui.label(egui::RichText::new(format!("{} cores / {} threads", cpu.cores, cpu.threads)).small());
+      if cpu.freq_mhz > 0.0 {
+        ui.label(
+          egui::RichText::new(format!("  ~{}", format_clock_ghz(cpu.freq_mhz)))
+            .small()
+            .color(COL_CPU),
+        );
+      }
+    });
+
+    ui.add_space(6.0);
+
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+      let mut total_kb = 0u64;
+      let mut available_kb = 0u64;
+      for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+          total_kb = rest.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+          available_kb = rest.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+        }
+      }
+      if total_kb > 0 {
+        let total_gb = total_kb as f64 / 1024.0 / 1024.0;
+        let avail_gb = available_kb as f64 / 1024.0 / 1024.0;
+        ui.horizontal(|ui| {
+          Self::settings_row_label(ui, "Memory", COL_CPU);
+          ui.label(egui::RichText::new(format!("{:.1} GB total", total_gb)).monospace());
+        });
+        ui.label(egui::RichText::new(format!("{:.1} GB available", avail_gb)).small().color(COL_CPU));
+      }
+    } else {
+      ui.label(egui::RichText::new("Memory: n/a").small().weak());
+    }
+
+    ui.add_space(6.0);
+
+    Self::settings_row_label(ui, "GPU", COL_GPU);
+    let clocks = detect_gpu_clocks_mhz();
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+      .args(["--query-gpu=index,name,memory.total,clocks.sm", "--format=csv,noheader,nounits"])
+      .output()
+      && output.status.success()
+    {
+      let text = String::from_utf8_lossy(&output.stdout);
+      let mut any = false;
+      for line in text.lines() {
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.len() >= 2 {
+          any = true;
+          let idx = parts[0];
+          let name = parts.get(1).unwrap_or(&"?");
+          let mem = parts.get(2).unwrap_or(&"?");
+          let clock = parts.get(3).unwrap_or(&"?");
+          ui.label(egui::RichText::new(format!("GPU {idx}: {name}")).monospace());
+          ui.label(
+            egui::RichText::new(format!("  Memory: {mem} MiB   Clock: {clock} MHz"))
+              .small()
+              .color(COL_GPU),
+          );
+        }
+      }
+      if !any {
+        ui.label(egui::RichText::new("No NVIDIA GPUs detected via nvidia-smi").small().weak());
+      }
+    } else if self.has_gpu {
+      ui.label(egui::RichText::new(format!("{} GPU(s) detected (CUDA present)", self.gpu_count)).small());
+      if !clocks.is_empty() {
+        for (id, mhz) in clocks {
+          ui.label(egui::RichText::new(format!("GPU {id} clock: {mhz} MHz")).small().color(COL_GPU));
+        }
+      }
+    } else {
+      ui.label(egui::RichText::new("No GPU / CUDA detected").small().weak());
+    }
+
+    ui.add_space(8.0);
+    Self::settings_hint(ui, "Basic system info collected without extra crates (Linux / nvidia-smi).");
+  }
+
+  fn draw_help_tab_wiki(
+    &self,
+    ui: &mut egui::Ui,
+  ) {
+    Self::settings_section(ui, "Wiki / Documentation", COL_CPU);
+
+    struct WikiEntry {
+      date: &'static str,
+      name: &'static str,
+      url: &'static str,
+    }
+
+    const WIKI: &[WikiEntry] = &[
+      WikiEntry {
+        date: "2025-11-16",
+        name: "Puzzle Hunter Pro",
+        url: "https://control-owl.github.io/blog/post/2026/11/16/puzzle-hunter-pro.html",
+      },
+      WikiEntry {
+        date: "2025-11-05",
+        name: "Key Hunter - How it all started",
+        url: "https://control-owl.github.io/blog/post/2026/10/09/key-hunter.html",
+      },
+    ];
+
+    if WIKI.is_empty() {
+      ui.label(egui::RichText::new("No wiki entries defined yet.").weak());
+      return;
+    }
+
+    for entry in WIKI {
+      ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(entry.date).small().monospace().color(COL_CPU));
+        ui.hyperlink_to(entry.name, entry.url);
+      });
+      ui.add_space(4.0);
+    }
+
+    ui.add_space(8.0);
+    Self::settings_hint(ui, "Click a link to open it in your browser.");
   }
 }
 
@@ -5393,49 +5727,3 @@ fn format_count(n: u64) -> String {
     format!("{:.1} G", n as f64 / 1_000_000_000.0)
   }
 }
-
-// fn url_encode(s: &str) -> String {
-//   let mut out = String::with_capacity(s.len() * 3);
-//   for b in s.bytes() {
-//     match b {
-//       b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-//         out.push(b as char);
-//       }
-//       b' ' => out.push_str("%20"),
-//       _ => out.push_str(&format!("%{:02X}", b)),
-//     }
-//   }
-//   out
-// }
-
-// fn open_mailto_url(mailto: &str) -> Result<(), String> {
-//   #[cfg(target_os = "windows")]
-//   {
-//     Command::new("cmd").args(["/C", "start", "", mailto]).spawn().map_err(|e| e.to_string())?;
-//     return Ok(());
-//   }
-//
-//   #[cfg(target_os = "macos")]
-//   {
-//     Command::new("open").arg(mailto).spawn().map_err(|e| e.to_string())?;
-//     return Ok(());
-//   }
-//
-//   #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-//   {
-//     if Command::new("xdg-email").arg("--version").output().is_ok() {
-//       let _ = Command::new("xdg-open").arg(mailto).spawn();
-//       return Ok(());
-//     }
-//
-//     if Command::new("xdg-open").arg(mailto).spawn().is_ok() {
-//       return Ok(());
-//     }
-//
-//     if Command::new("gio").args(["open", mailto]).spawn().is_ok() {
-//       return Ok(());
-//     }
-//
-//     Err("No mailto handler found (tried xdg-open / gio)".into())
-//   }
-// }

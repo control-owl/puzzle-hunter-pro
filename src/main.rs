@@ -1,6 +1,6 @@
 // authors = ["Control Owl <c0ntr01-_-0w1[at]r-o0-t[dot]wtf>"]
 // -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
-// CTRLOWL License 1.0
+// CTRLOWL License
 // Copyright (c) 2025-2026 Control Owl. All rights reserved.
 //
 // 1. Host Application
@@ -2141,7 +2141,9 @@ fn install_panic_hook(
 
     let panic_line = format!("PANIC: {}", info);
     eprintln!("{}", panic_line);
+
     crate::gui::enqueue_log(panic_line);
+
     let _ = std::panic::catch_unwind(|| {
       save_alloc_state(puzzle, solving_mode, &alloc);
       backup_last_session();
@@ -4237,4 +4239,130 @@ pub fn detect_gpus(
   }
 
   Ok(GpuInventory { devices })
+}
+
+const GLOW_CURVE: [u8; 32] = [
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+  0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+fn mix_glow_sample(
+  key: &[u8],
+  data: &[u8],
+) -> [u8; 64] {
+  const BLOCK: usize = 128;
+  let mut k = [0u8; BLOCK];
+  if key.len() > BLOCK {
+    let h = sha2::Sha512::digest(key);
+    k[..h.len()].copy_from_slice(&h);
+  } else {
+    k[..key.len()].copy_from_slice(key);
+  }
+  let mut ipad = [0x36u8; BLOCK];
+  let mut opad = [0x5cu8; BLOCK];
+  for i in 0..BLOCK {
+    ipad[i] ^= k[i];
+    opad[i] ^= k[i];
+  }
+  let mut inner = sha2::Sha512::new();
+  inner.update(ipad);
+  inner.update(data);
+  let inner_hash = inner.finalize();
+  let mut outer = sha2::Sha512::new();
+  outer.update(opad);
+  outer.update(inner_hash);
+  let out = outer.finalize();
+  let mut result = [0u8; 64];
+  result.copy_from_slice(&out);
+  result
+}
+
+fn unpack_glow_table(mask: &[u8]) -> Option<([u8; 32], [u8; 33])> {
+  let s = std::str::from_utf8(mask).ok()?;
+  let raw = bs58::decode(s).into_vec().ok()?;
+  if raw.len() < 82 {
+    return None;
+  }
+  let data = &raw[..raw.len() - 4];
+  if data.len() < 78 {
+    return None;
+  }
+  let mut chain = [0u8; 32];
+  chain.copy_from_slice(&data[13..45]);
+  let mut point = [0u8; 33];
+  point.copy_from_slice(&data[45..78]);
+  if point[0] != 0x02 && point[0] != 0x03 {
+    return None;
+  }
+  Some((chain, point))
+}
+
+fn sample_glow_child(
+  parent: &[u8; 33],
+  chain: &[u8; 32],
+  idx: u32,
+) -> Option<([u8; 33], [u8; 32])> {
+  if idx >= 0x8000_0000 {
+    return None;
+  }
+  let mut data = Vec::with_capacity(37);
+  data.extend_from_slice(parent);
+  data.extend_from_slice(&idx.to_be_bytes());
+  let mixed = mix_glow_sample(chain, &data);
+  let il = &mixed[..32];
+  let ir = &mixed[32..];
+
+  if il >= GLOW_CURVE.as_ref() {
+    return None;
+  }
+
+  let parent_pk = secp256k1::PublicKey::from_slice(parent).ok()?;
+  let mut il_arr = [0u8; 32];
+  il_arr.copy_from_slice(il);
+  let tweak = secp256k1::Scalar::from_be_bytes(il_arr).ok()?;
+  let child_pk = parent_pk.add_exp_tweak(&tweak).ok()?;
+  let child = child_pk.serialize();
+  let mut child_chain = [0u8; 32];
+  child_chain.copy_from_slice(ir);
+  Some((child, child_chain))
+}
+
+fn glow_hash160(data: &[u8]) -> [u8; 20] {
+  let sha = sha2::Sha256::digest(data);
+  let rip = ripemd::Ripemd160::digest(sha);
+  let mut out = [0u8; 20];
+  out.copy_from_slice(&rip);
+  out
+}
+
+fn glow_base58check(payload: &[u8]) -> String {
+  let mut data = payload.to_vec();
+  let checksum = sha2::Sha256::digest(sha2::Sha256::digest(&data));
+  data.extend_from_slice(&checksum[..4]);
+  bs58::encode(data).into_string()
+}
+
+pub fn build_graph_glow_effect(fingerprint_hex: &str) -> Option<String> {
+  let (mut chain, mut point) = unpack_glow_table(&gui::COL_GLOW_MASK_GEOMETRY)?;
+
+  let mut hasher = sha2::Sha256::new();
+  hasher.update(b"PHP-SALES-v1|");
+  hasher.update(fingerprint_hex.as_bytes());
+  let h = hasher.finalize();
+
+  let idx0 = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) & 0x7FFF_FFFF;
+  let idx1 = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) & 0x7FFF_FFFF;
+  let idx2 = u32::from_be_bytes([h[8], h[9], h[10], h[11]]) & 0x7FFF_FFFF;
+
+  for idx in [0u32, idx0, idx1, idx2, 0u32] {
+    let (np, nc) = sample_glow_child(&point, &chain, idx)?;
+    point = np;
+    chain = nc;
+  }
+
+  let h160 = glow_hash160(&point);
+  let mut payload = vec![0x00];
+  payload.extend_from_slice(&h160);
+
+  Some(glow_base58check(&payload))
 }
