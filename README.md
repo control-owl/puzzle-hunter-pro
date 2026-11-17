@@ -4,6 +4,7 @@
 
 <img src="./.github/preview/latest-dashboard.png" alt="Dashboard" width="800">
 
+
 **Free host application. Commercial high-performance CUDA kernels.**
 
 The 1000 BTC Puzzle (created in 2015 by saatoshi_rising) remains still unsolved. The search space is enormous. PHP was written from the ground up as a specialized engine for these exact ranges: a native Rust host, a large private family of CUDA kernels, and a coordinated work allocator that does not waste keys.
@@ -148,6 +149,19 @@ Please follow the following tutorial: [How to install](./INSTALLATION.md)
 - Not open-source kernels
 - Not guaranteed to find a key (the ranges are large; the software improves the rate at which you search them)
 
+---
+
+
+# Blog post
+
+If you are interested in reading a long post how this project started, here you can read more:
+
+- [Puzzle Hunter Pro](https://control-owl.github.io/blog/post/2026/11/16/puzzle-hunter-pro.html)
+- [Key Hunter (old version)](https://control-owl.github.io/blog/post/2026/10/09/key-hunter.html)
+
+and more...
+
+[https://control-owl.github.io/](https://control-owl.github.io/)
 
 ---
 
