@@ -20,7 +20,7 @@ If you are going to spend electricity looking for a key, use a tool that was des
 
 PHP is a native desktop application (Rust + egui) that searches the unsolved ranges of the public 1000 BTC Puzzle.
 
-- **Puzzle range**: any unsolved puzzle from **#70 to #160**
+- **Puzzle range**: any unsolved puzzle from **#71 to #160**
 - **Host**: free, open for inspection, runs on CPU fully and on GPU once a licensed kernel package is loaded
 - **Kernels**: commercial, closed-source, compiled and locked to your specific machine
 - **Goal**: maximum useful keys per watt on the exact problem that still has a large remaining reward
