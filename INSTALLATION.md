@@ -1,9 +1,10 @@
 This tutorial covers building **puzzle-hunter-pro** from source on Ubuntu, Arch, Fedora, and Windows. 
 
-On every system you need 
+On every system you need:
 
 1. **Rust 1.85 or newer** (required by edition 2024)
 2. **NVIDIA driver**, and the **CUDA 11.0 or 12.0 or 13.0 toolkit** depending on your card.
+3. **GnuPG (`gpg`)** - required to generate license requests and to verify/load signed `.OWL` kernel packages. Without it the application will refuse to load any commercial kernel package.
 
 In this tutorial we are assuming that you are running latest OS with latest drivers.
 
@@ -19,6 +20,8 @@ In this tutorial we are assuming that you are running latest OS with latest driv
 ## Prerequisites on every system
 
 Install Rust with rustup on all platforms. On Linux, run `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`, then restart your shell. On Windows, download `rustup-init.exe` from rustup.rs. Confirm the install with `rustc --version`, which should report 1.85 or newer.
+
+**GnuPG is mandatory at runtime.** The host uses `gpg` to encrypt the license request to the developer and to verify the detached signature on every `.OWL` package. Install it with your package manager (`gnupg` on Debian/Ubuntu/Fedora, `gnupg` on Arch, Gpg4win or `winget install GnuPG.GnuPG` on Windows).
 
 The build does not invoke `nvcc`. The `cudarc` crate loads the driver (`libcuda.so` or `nvcuda.dll`) and NVRTC (the runtime compiler for GPU kernels) at runtime, so the toolkit matters mainly for its runtime libraries. Install it anyway, because the program needs NVRTC when it runs.
 

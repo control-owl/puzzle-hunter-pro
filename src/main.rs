@@ -4119,25 +4119,49 @@ pub struct GpuInventory {
 }
 
 pub fn has_cuda_device() -> bool {
-  let candidates = [
-    "libcuda.so.1",
-    "libcuda.so",
-    "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-    "/usr/lib/x86_64-linux-gnu/libcuda.so",
-    "/usr/lib64/libcuda.so.1",
-    "/usr/lib64/libcuda.so",
-    "/usr/local/cuda/lib64/libcuda.so.1",
-    "/usr/local/cuda/lib64/libcuda.so",
-    "/usr/lib/wsl/lib/libcuda.so.1",
-    "/usr/lib/wsl/lib/libcuda.so",
-    "/opt/cuda/lib64/libcuda.so.1",
-    "/opt/cuda/lib64/libcuda.so",
-  ];
-  for path in candidates {
-    if std::path::Path::new(path).exists() {
-      return true;
+  #[cfg(any(target_os = "linux", target_os = "android"))]
+  {
+    let candidates = [
+      "libcuda.so.1",
+      "libcuda.so",
+      "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+      "/usr/lib/x86_64-linux-gnu/libcuda.so",
+      "/usr/lib64/libcuda.so.1",
+      "/usr/lib64/libcuda.so",
+      "/usr/local/cuda/lib64/libcuda.so.1",
+      "/usr/local/cuda/lib64/libcuda.so",
+      "/usr/lib/wsl/lib/libcuda.so.1",
+      "/usr/lib/wsl/lib/libcuda.so",
+      "/opt/cuda/lib64/libcuda.so.1",
+      "/opt/cuda/lib64/libcuda.so",
+    ];
+    for path in candidates {
+      if std::path::Path::new(path).exists() {
+        return true;
+      }
     }
   }
+
+  #[cfg(target_os = "windows")]
+  {
+    let candidates = ["nvcuda.dll", "C:\\Windows\\System32\\nvcuda.dll", "C:\\Windows\\SysWOW64\\nvcuda.dll"];
+    for path in candidates {
+      if std::path::Path::new(path).exists() {
+        return true;
+      }
+    }
+  }
+
+  #[cfg(target_os = "macos")]
+  {
+    let candidates = ["libcuda.dylib", "/usr/local/cuda/lib/libcuda.dylib"];
+    for path in candidates {
+      if std::path::Path::new(path).exists() {
+        return true;
+      }
+    }
+  }
+
   if let Ok(output) = std::process::Command::new("nvidia-smi").arg("-L").output()
     && output.status.success()
     && !output.stdout.is_empty()
@@ -4153,7 +4177,7 @@ pub fn detect_gpus(
   parallel_keys: u32,
 ) -> Result<GpuInventory, Box<dyn Error>> {
   if !has_cuda_device() {
-    return Err("No CUDA driver / libcuda.so found on this system".into());
+    return Err("No CUDA driver found on this system (libcuda.so / nvcuda.dll / nvidia-smi)".into());
   }
 
   let num_devices = match CudaContext::device_count() {

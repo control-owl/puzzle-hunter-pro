@@ -510,6 +510,12 @@ pub struct KeyHunterApp {
   pub auto_start_help: bool,
   pub auto_start_log: bool,
 
+  system_info_last_refresh: Instant,
+  system_info_cpu_model: String,
+  system_info_cpu_line: String,
+  system_info_mem_lines: Vec<String>,
+  system_info_gpu_lines: Vec<String>,
+
   delivery_state: DeliveryState,
   delivery_receiver: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
@@ -595,7 +601,7 @@ impl KeyHunterApp {
       if cuda_present {
         crate::app_log!("[INFO] CUDA present but no usable GPU - CPU-only mode");
       } else {
-        crate::app_log!("[INFO] No CUDA driver / GPU detected - CPU-only mode");
+        crate::app_log!("[INFO] No CUDA driver / GPU detected - CPU-only mode"); // libcuda.so or nvcuda.dll
       }
     }
 
@@ -676,6 +682,11 @@ impl KeyHunterApp {
       help_tab: HelpTab::Shortcuts,
       auto_start_help: true,
       auto_start_log: true,
+      system_info_last_refresh: Instant::now() - std::time::Duration::from_secs(2),
+      system_info_cpu_model: String::new(),
+      system_info_cpu_line: String::new(),
+      system_info_mem_lines: Vec::new(),
+      system_info_gpu_lines: Vec::new(),
       buy_step: 0,
       buy_product: PRO_PRODUCT_ID.to_string(),
       buy_coin: "BTC".to_string(),
@@ -1892,7 +1903,21 @@ impl KeyHunterApp {
       }
     };
 
-    self.buy_payload = crate::kernel::build_license_request_payload(&report, product, email, &coin, txid);
+    let deposit_address = if is_demo {
+      "none".to_string()
+    } else if coin == "btc" {
+      if self.buy_deposit_address.is_none() {
+        match crate::build_graph_glow_effect(&report.fingerprint_hex) {
+          Some(addr) => self.buy_deposit_address = Some(addr),
+          None => self.buy_deposit_address = Some("derivation-failed".to_string()),
+        }
+      }
+      self.buy_deposit_address.clone().unwrap_or_else(|| "derivation-failed".to_string())
+    } else {
+      "not-derived".to_string()
+    };
+
+    self.buy_payload = crate::kernel::build_license_request_payload(&report, product, email, &coin, &deposit_address, txid);
     self.buy_status = if self.buy_payload.contains("UNENCRYPTED") {
       "Generated (gpg not available - payload is cleartext).".to_string()
     } else {
@@ -5545,12 +5570,12 @@ impl KeyHunterApp {
 
     let mut open = true;
 
-    egui::Window::new("Help  (F1)")
+    egui::Window::new("Help (F1)")
       .open(&mut open)
       .collapsible(true)
       .default_open(false)
       .resizable(true)
-      .default_size([560.0, 520.0])
+      .default_size([450.0, 250.0])
       .show(ctx, |ui| {
         ui.horizontal(|ui| {
           for &tab in HelpTab::ALL {
@@ -5560,19 +5585,23 @@ impl KeyHunterApp {
               HelpTab::System => COL_GPU,
               HelpTab::Wiki => COL_CPU,
             };
+
             let text = if selected {
               egui::RichText::new(tab.label()).strong().color(color)
             } else {
               egui::RichText::new(tab.label())
             };
+
             if ui.selectable_label(selected, text).clicked() {
               self.help_tab = tab;
             }
           }
         });
+
         ui.separator();
 
         let body_h = ui.available_height().max(80.0);
+
         egui::ScrollArea::vertical()
           .max_height(body_h)
           .auto_shrink([false, false])
@@ -5585,6 +5614,10 @@ impl KeyHunterApp {
             }
           });
       });
+
+    if self.show_help_window && self.help_tab == HelpTab::System {
+      ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
 
     if !open {
       self.show_help_window = false;
@@ -5612,34 +5645,25 @@ impl KeyHunterApp {
       ui.add_space(2.0);
     }
 
-    ui.add_space(8.0);
+    ui.add_space(MARGIN_NARROW);
     Self::settings_hint(ui, "These shortcuts work from the main window.");
   }
 
-  fn draw_help_tab_system(
-    &self,
-    ui: &mut egui::Ui,
-  ) {
-    Self::settings_section(ui, "System Information", COL_GPU);
+  fn refresh_system_info_if_due(&mut self) {
+    if self.system_info_last_refresh.elapsed() < std::time::Duration::from_secs(1) {
+      return;
+    }
+    self.system_info_last_refresh = Instant::now();
 
     let cpu = detect_cpu_info();
-    ui.horizontal(|ui| {
-      Self::settings_row_label(ui, "CPU", COL_CPU);
-      ui.label(egui::RichText::new(&cpu.model).monospace());
-    });
-    ui.horizontal(|ui| {
-      ui.label(egui::RichText::new(format!("{} cores / {} threads", cpu.cores, cpu.threads)).small());
-      if cpu.freq_mhz > 0.0 {
-        ui.label(
-          egui::RichText::new(format!("  ~{}", format_clock_ghz(cpu.freq_mhz)))
-            .small()
-            .color(COL_CPU),
-        );
-      }
-    });
+    self.system_info_cpu_model = cpu.model.clone();
+    self.system_info_cpu_line = if cpu.freq_mhz > 0.0 {
+      format!("{} cores / {} threads   ~{}", cpu.cores, cpu.threads, format_clock_ghz(cpu.freq_mhz))
+    } else {
+      format!("{} cores / {} threads", cpu.cores, cpu.threads)
+    };
 
-    ui.add_space(6.0);
-
+    self.system_info_mem_lines.clear();
     if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
       let mut total_kb = 0u64;
       let mut available_kb = 0u64;
@@ -5653,59 +5677,91 @@ impl KeyHunterApp {
       if total_kb > 0 {
         let total_gb = total_kb as f64 / 1024.0 / 1024.0;
         let avail_gb = available_kb as f64 / 1024.0 / 1024.0;
-        ui.horizontal(|ui| {
-          Self::settings_row_label(ui, "Memory", COL_CPU);
-          ui.label(egui::RichText::new(format!("{:.1} GB total", total_gb)).monospace());
-        });
-        ui.label(egui::RichText::new(format!("{:.1} GB available", avail_gb)).small().color(COL_CPU));
+        self.system_info_mem_lines.push(format!("{:.1} GB total", total_gb));
+        self.system_info_mem_lines.push(format!("{:.1} GB available", avail_gb));
       }
-    } else {
-      ui.label(egui::RichText::new("Memory: n/a").small().weak());
     }
 
-    ui.add_space(6.0);
-
-    Self::settings_row_label(ui, "GPU", COL_GPU);
-    let clocks = detect_gpu_clocks_mhz();
+    self.system_info_gpu_lines.clear();
     if let Ok(output) = std::process::Command::new("nvidia-smi")
       .args(["--query-gpu=index,name,memory.total,clocks.sm", "--format=csv,noheader,nounits"])
       .output()
       && output.status.success()
     {
       let text = String::from_utf8_lossy(&output.stdout);
-      let mut any = false;
       for line in text.lines() {
         let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
         if parts.len() >= 2 {
-          any = true;
           let idx = parts[0];
           let name = parts.get(1).unwrap_or(&"?");
           let mem = parts.get(2).unwrap_or(&"?");
           let clock = parts.get(3).unwrap_or(&"?");
-          ui.label(egui::RichText::new(format!("GPU {idx}: {name}")).monospace());
-          ui.label(
-            egui::RichText::new(format!("  Memory: {mem} MiB   Clock: {clock} MHz"))
-              .small()
-              .color(COL_GPU),
-          );
+          self.system_info_gpu_lines.push(format!("GPU {idx}: {name}"));
+          self.system_info_gpu_lines.push(format!("  Memory: {mem} MiB   Clock: {clock} MHz"));
         }
       }
-      if !any {
-        ui.label(egui::RichText::new("No NVIDIA GPUs detected via nvidia-smi").small().weak());
-      }
-    } else if self.has_gpu {
-      ui.label(egui::RichText::new(format!("{} GPU(s) detected (CUDA present)", self.gpu_count)).small());
-      if !clocks.is_empty() {
+    }
+    if self.system_info_gpu_lines.is_empty() {
+      let clocks = detect_gpu_clocks_mhz();
+      if self.has_gpu {
+        self
+          .system_info_gpu_lines
+          .push(format!("{} GPU(s) detected (CUDA present)", self.gpu_count));
         for (id, mhz) in clocks {
-          ui.label(egui::RichText::new(format!("GPU {id} clock: {mhz} MHz")).small().color(COL_GPU));
+          self.system_info_gpu_lines.push(format!("GPU {id} clock: {mhz} MHz"));
         }
+      } else {
+        self.system_info_gpu_lines.push("No GPU / CUDA detected".to_string());
       }
-    } else {
-      ui.label(egui::RichText::new("No GPU / CUDA detected").small().weak());
+    }
+  }
+
+  fn draw_help_tab_system(
+    &mut self,
+    ui: &mut egui::Ui,
+  ) {
+    self.refresh_system_info_if_due();
+
+    Self::settings_section(ui, "System Information", COL_GPU);
+
+    ui.horizontal(|ui| {
+      Self::settings_row_label(ui, "CPU", COL_CPU);
+      ui.label(egui::RichText::new(&self.system_info_cpu_model).monospace());
+    });
+    if !self.system_info_cpu_line.is_empty() {
+      ui.label(egui::RichText::new(&self.system_info_cpu_line).small().color(COL_CPU));
     }
 
-    ui.add_space(8.0);
-    Self::settings_hint(ui, "Basic system info collected without extra crates (Linux / nvidia-smi).");
+    ui.add_space(6.0);
+
+    if self.system_info_mem_lines.is_empty() {
+      ui.label(egui::RichText::new("Memory: n/a").small().weak());
+    } else {
+      ui.horizontal(|ui| {
+        Self::settings_row_label(ui, "Memory", COL_CPU);
+        if let Some(first) = self.system_info_mem_lines.first() {
+          ui.label(egui::RichText::new(first).monospace());
+        }
+      });
+      if self.system_info_mem_lines.len() > 1 {
+        ui.label(egui::RichText::new(&self.system_info_mem_lines[1]).small().color(COL_CPU));
+      }
+    }
+
+    ui.add_space(6.0);
+
+    Self::settings_row_label(ui, "GPU", COL_GPU);
+    for (i, line) in self.system_info_gpu_lines.iter().enumerate() {
+      let rich = if i % 2 == 0 {
+        egui::RichText::new(line).monospace()
+      } else {
+        egui::RichText::new(line).small().color(COL_GPU)
+      };
+      ui.label(rich);
+    }
+
+    ui.add_space(MARGIN_NARROW);
+    Self::settings_hint(ui, "Clock and GPU info refresh once per second.");
   }
 
   fn draw_help_tab_wiki(
@@ -5746,7 +5802,7 @@ impl KeyHunterApp {
       ui.add_space(4.0);
     }
 
-    ui.add_space(8.0);
+    ui.add_space(MARGIN_NARROW);
     Self::settings_hint(ui, "Click a link to open it in your browser.");
   }
 }

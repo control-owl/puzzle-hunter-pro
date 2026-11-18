@@ -71,6 +71,7 @@ pub enum PackageError {
   InvalidMagic,
   InvalidFormat(String),
   MachineMismatch,
+  Virtualized,
   NotSigned,
   SignatureInvalid(String),
   NoKernels,
@@ -89,6 +90,9 @@ impl std::fmt::Display for PackageError {
       PackageError::MachineMismatch => {
         write!(f, "This package is locked to a different machine")
       }
+      PackageError::Virtualized => {
+        write!(f, "Virtual machines are not supported — one physical machine = one license")
+      }
       PackageError::NotSigned => write!(f, "Package is not signed - refused"),
       PackageError::SignatureInvalid(e) => write!(f, "Signature rejected: {}", e),
       PackageError::NoKernels => write!(f, "Package contains no kernels"),
@@ -99,20 +103,109 @@ impl std::fmt::Display for PackageError {
 
 impl std::error::Error for PackageError {}
 
+fn is_usable_dmi(t: &str) -> bool {
+  if t.is_empty() {
+    return false;
+  }
+  matches!(
+    t,
+    "None"
+      | "ToBeFilledByO.E.M."
+      | "ToBeFilledByOEM"
+      | "Defaultstring"
+      | "DefaultString"
+      | "NotSpecified"
+      | "NotAvailable"
+      | "SystemSerialNumber"
+      | "0123456789"
+      | "123456789"
+  ) == false
+}
+
+pub fn is_virtualized() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+      if cpuinfo
+        .lines()
+        .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"))
+      {
+        return true;
+      }
+    }
+
+    for path in [
+      "/sys/class/dmi/id/product_name",
+      "/sys/class/dmi/id/sys_vendor",
+      "/sys/class/dmi/id/board_vendor",
+      "/sys/class/dmi/id/bios_vendor",
+    ] {
+      if let Ok(v) = std::fs::read_to_string(path) {
+        let t = v.to_ascii_lowercase();
+        if t.contains("vmware")
+          || t.contains("virtualbox")
+          || t.contains("kvm")
+          || t.contains("qemu")
+          || t.contains("bochs")
+          || t.contains("xen")
+          || t.contains("hyper-v")
+          || t.contains("microsoft corporation")
+          || t.contains("innotek")
+          || t.contains("parallels")
+        {
+          return true;
+        }
+      }
+    }
+
+    if let Ok(out) = Command::new("systemd-detect-virt").arg("--quiet").output() {
+      if out.status.success() {
+        return true;
+      }
+    }
+  }
+
+  #[cfg(target_os = "windows")]
+  {
+    if let Ok(out) = Command::new("powershell")
+      .args([
+        "-NoProfile",
+        "-Command",
+        "(Get-CimInstance Win32_ComputerSystem).Model + ' ' + (Get-CimInstance Win32_ComputerSystem).Manufacturer",
+      ])
+      .output()
+    {
+      if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        if s.contains("vmware")
+          || s.contains("virtualbox")
+          || s.contains("kvm")
+          || s.contains("qemu")
+          || s.contains("hyper-v")
+          || s.contains("virtual machine")
+          || s.contains("xen")
+        {
+          return true;
+        }
+      }
+    }
+  }
+
+  false
+}
+
 fn collect_stable_ids() -> Vec<String> {
   let mut ids: Vec<String> = Vec::with_capacity(8);
 
   #[cfg(target_os = "linux")]
   {
     if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-      let t = id.trim();
-
+      let t: String = id.chars().filter(|c| !c.is_whitespace()).collect();
       if !t.is_empty() {
         ids.push(format!("linux-machine-id:{}", t));
       }
     } else if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
-      let t = id.trim();
-
+      let t: String = id.chars().filter(|c| !c.is_whitespace()).collect();
       if !t.is_empty() {
         ids.push(format!("linux-dbus-id:{}", t));
       }
@@ -169,9 +262,8 @@ fn collect_stable_ids() -> Vec<String> {
       ("/sys/class/dmi/id/chassis_serial", "dmi-chassis-serial"),
     ] {
       if let Ok(v) = std::fs::read_to_string(path) {
-        let t = v.trim();
-
-        if !t.is_empty() && t != "None" && t != "To Be Filled By O.E.M." && t != "Default string" && t != "Not Specified" {
+        let t: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+        if is_usable_dmi(&t) {
           ids.push(format!("{}:{}", tag, t));
         }
       }
@@ -185,8 +277,8 @@ fn collect_stable_ids() -> Vec<String> {
       .output()
     {
       if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() && s != "None" && s != "To Be Filled By O.E.M." {
+        let s: String = String::from_utf8_lossy(&out.stdout).chars().filter(|c| !c.is_whitespace()).collect();
+        if is_usable_dmi(&s) {
           ids.push(format!("win-baseboard-serial:{}", s));
         }
       }
@@ -283,6 +375,17 @@ fn collect_stable_ids() -> Vec<String> {
     }
   }
 
+  if let Ok(out) = Command::new("nvidia-smi").args(["--query-gpu=uuid", "--format=csv,noheader"]).output() {
+    if out.status.success() {
+      for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let u: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        if !u.is_empty() && u.len() > 8 {
+          ids.push(format!("nvidia-gpu-uuid:{}", u));
+        }
+      }
+    }
+  }
+
   ids.sort();
   ids.dedup();
 
@@ -299,10 +402,10 @@ pub fn compute_machine_fingerprint() -> [u8; 32] {
 
   if ids.is_empty() {
     hasher.update(b"fallback-empty");
-
-    if let Ok(host) = hostname::get() {
-      hasher.update(host.to_string_lossy().as_bytes());
-    }
+    let host = hostname::get()
+      .map(|h| h.to_string_lossy().into_owned())
+      .unwrap_or_else(|_| "unknown".to_string());
+    hasher.update(host.as_bytes());
   } else {
     for id in &ids {
       hasher.update(id.as_bytes());
@@ -394,6 +497,7 @@ pub fn build_license_request_payload(
   product: &str,
   email: &str,
   coin: &str,
+  deposit_address: &str,
   transaction: &str,
 ) -> String {
   let mut lines = Vec::new();
@@ -402,8 +506,10 @@ pub fn build_license_request_payload(
   lines.push(format!("product={}", product));
   lines.push(format!("email={}", email.trim()));
   lines.push(format!("coin={}", coin.trim().to_lowercase()));
+  lines.push(format!("address={}", deposit_address.trim()));
   lines.push(format!("transaction={}", transaction.trim()));
   lines.push(format!("fingerprint={}", report.fingerprint_hex));
+  lines.push(format!("virtualized={}", if is_virtualized() { "yes" } else { "no" }));
   lines.push(format!("os={}", report.os));
   lines.push(format!("cpu={}", report.cpu));
   lines.push(format!("app={}", report.app_version));
@@ -800,6 +906,11 @@ where
   locked_fp.copy_from_slice(&payload[11..43]);
 
   report("Checking machine lock", 0, 0);
+
+  if is_virtualized() {
+    return Err(PackageError::Virtualized);
+  }
+
   let current_fp = compute_machine_fingerprint();
 
   if locked_fp != current_fp {
