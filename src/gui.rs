@@ -197,6 +197,12 @@ const MARGIN_WIDE: f32 = 12.0;
 const FRAME_W: f32 = 250.0;
 const FRAME_H: f32 = 250.0;
 
+pub const BLOCK_SIZES: &[u32] = &[64, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024];
+pub const GRID_SIZES: &[u32] = &[
+  16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096,
+];
+pub const CHUNK_MULTIPLIERS: &[u32] = &[1, 2, 4, 8, 16];
+
 fn delivery_route(fp_hex: &str) -> String {
   let local: String = fp_hex
     .chars()
@@ -252,17 +258,17 @@ fn sales_catalog() -> &'static [SalesPeriod] {
   &[
     SalesPeriod {
       start: "2020-01-01 00:00",
-      end: "2026-11-15 00:00",
+      end: "2026-11-23 00:00",
       action: SalesAction::NoSale,
       discount_pct: 0,
       note: "Preparing the next batch of kernels. Sales open 23 Nov 2026.",
     },
     SalesPeriod {
-      start: "2026-11-15 00:00",
+      start: "2026-11-23 00:00",
       end: "2026-12-23 00:00",
       action: SalesAction::Sale,
       discount_pct: 50,
-      note: "Launch discount – 50% off until 23 Dec 2026.",
+      note: "Launch discount - 50% off until 23 Dec 2026.",
     },
     SalesPeriod {
       start: "2026-12-23 00:00",
@@ -501,6 +507,8 @@ pub struct KeyHunterApp {
 
   pub show_help_window: bool,
   pub help_tab: HelpTab,
+  pub auto_start_help: bool,
+  pub auto_start_log: bool,
 
   delivery_state: DeliveryState,
   delivery_receiver: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -510,6 +518,7 @@ pub struct KeyHunterApp {
 pub enum SettingsTab {
   Core,
   Solver,
+  Gui,
 
   #[cfg(feature = "next_release")]
   Tray,
@@ -538,6 +547,7 @@ impl SettingsTab {
   pub const ALL: &'static [SettingsTab] = &[
     SettingsTab::Core,
     SettingsTab::Solver,
+    SettingsTab::Gui,
     #[cfg(feature = "next_release")]
     SettingsTab::Tray,
   ];
@@ -546,6 +556,7 @@ impl SettingsTab {
     match self {
       SettingsTab::Core => "Core",
       SettingsTab::Solver => "Solver",
+      SettingsTab::Gui => "GUI",
 
       #[cfg(feature = "next_release")]
       SettingsTab::Tray => "Tray",
@@ -661,8 +672,10 @@ impl KeyHunterApp {
       loaded_email: None,
 
       show_buy_window: false,
-      show_help_window: false,
+      show_help_window: true,
       help_tab: HelpTab::Shortcuts,
+      auto_start_help: true,
+      auto_start_log: true,
       buy_step: 0,
       buy_product: PRO_PRODUCT_ID.to_string(),
       buy_coin: "BTC".to_string(),
@@ -678,7 +691,7 @@ impl KeyHunterApp {
       show_log_window: true,
 
       #[cfg(not(feature = "test_vectors"))]
-      show_log_window: false,
+      show_log_window: true,
 
       log_auto_popup: true,
       log_entries: {
@@ -1085,6 +1098,8 @@ impl KeyHunterApp {
       ("tray_enabled".into(), if self.tray_enabled { "1" } else { "0" }.into()),
       ("selected_puzzle".into(), self.selected_puzzle.to_string()),
       ("all_turn_secs".into(), self.all_turn_secs.to_string()),
+      ("auto_start_help".into(), if self.auto_start_help { "1" } else { "0" }.into()),
+      ("auto_start_log".into(), if self.auto_start_log { "1" } else { "0" }.into()),
     ]
   }
 
@@ -1123,6 +1138,8 @@ impl KeyHunterApp {
     self.selected_puzzle = DEFAULT_PUZZLE;
     self.all_turn_secs = ALL_MODE_DEFAULT_TURN_SECS;
     self.all_turn_secs_atomic.store(ALL_MODE_DEFAULT_TURN_SECS, Ordering::Relaxed);
+    self.auto_start_help = true;
+    self.auto_start_log = true;
     if let Some(item) = &self.tray_hide_item {
       item.set_checked(self.hide_on_close);
     }
@@ -1264,6 +1281,17 @@ impl KeyHunterApp {
       self.all_turn_secs = n;
       self.all_turn_secs_atomic.store(n, Ordering::Relaxed);
     }
+
+    if let Some(v) = get("auto_start_help") {
+      self.auto_start_help = v == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Some(v) = get("auto_start_log") {
+      self.auto_start_log = v == "1" || v.eq_ignore_ascii_case("true");
+    }
+
+    self.show_help_window = self.auto_start_help;
+    self.show_log_window = self.auto_start_log;
+
     self.ensure_tray_state();
     self.refresh_kernel();
     Ok(())
@@ -1364,6 +1392,7 @@ impl KeyHunterApp {
     let mut open = true;
     egui::Window::new("Log (F12)")
       .default_size([720.0, 360.0])
+      .default_open(false)
       .resizable(true)
       .collapsible(true)
       .open(&mut open)
@@ -4153,7 +4182,7 @@ impl eframe::App for KeyHunterApp {
                           .width(three_size)
                           .selected_text(egui::RichText::new(format!("{}", self.block_size)).color(COL_GPU))
                           .show_ui(ui, |ui| {
-                            for &b in &[64u32, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024] {
+                            for &b in BLOCK_SIZES {
                               ui.selectable_value(&mut self.block_size, b, format!("{b}"));
                             }
                           });
@@ -4167,9 +4196,7 @@ impl eframe::App for KeyHunterApp {
                           .width(three_size)
                           .selected_text(egui::RichText::new(format!("{}", self.grid_size)).color(COL_GPU))
                           .show_ui(ui, |ui| {
-                            for &g in &[
-                              16u32, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096,
-                            ] {
+                            for &g in GRID_SIZES {
                               ui.selectable_value(&mut self.grid_size, g, format!("{g}"));
                             }
                           });
@@ -4183,7 +4210,7 @@ impl eframe::App for KeyHunterApp {
                           .width(three_size)
                           .selected_text(egui::RichText::new(format!("{}x", self.chunk_multiplier)).color(COL_GPU))
                           .show_ui(ui, |ui| {
-                            for &m in &[1u32, 2, 4, 8, 16] {
+                            for &m in CHUNK_MULTIPLIERS {
                               ui.selectable_value(&mut self.chunk_multiplier, m, format!("{m}x"));
                             }
                           })
@@ -4965,6 +4992,7 @@ impl KeyHunterApp {
             let color = match tab {
               SettingsTab::Core => COL_ACCENT,
               SettingsTab::Solver => COL_GPU,
+              SettingsTab::Gui => COL_ACCENT,
 
               #[cfg(feature = "next_release")]
               SettingsTab::Tray => COL_CPU,
@@ -4991,6 +5019,7 @@ impl KeyHunterApp {
             match self.settings_tab {
               SettingsTab::Core => self.draw_settings_tab_core(ui),
               SettingsTab::Solver => self.draw_settings_tab_solver(ui),
+              SettingsTab::Gui => self.draw_settings_tab_gui(ui),
 
               #[cfg(feature = "next_release")]
               SettingsTab::Tray => self.draw_settings_tab_tray(ui),
@@ -5082,6 +5111,39 @@ impl KeyHunterApp {
   ) {
     ui.label(egui::RichText::new(text).small().weak());
     ui.add_space(6.0);
+  }
+
+  fn draw_settings_tab_gui(
+    &mut self,
+    ui: &mut egui::Ui,
+  ) {
+    Self::settings_section(ui, "Startup windows", COL_ACCENT);
+
+    let mut help = self.auto_start_help;
+    if ui
+      .checkbox(&mut help, egui::RichText::new("Auto-start Help window").color(COL_ACCENT))
+      .on_hover_text("When enabled, the Help window opens collapsed on every app start.")
+      .changed()
+    {
+      self.auto_start_help = help;
+    }
+    Self::settings_hint(ui, "Help opens collapsed. Disable to keep it closed at startup.");
+
+    let mut log = self.auto_start_log;
+    if ui
+      .checkbox(&mut log, egui::RichText::new("Auto-start Log window").color(COL_GPU))
+      .on_hover_text("When enabled, the Log window opens collapsed on every app start.")
+      .changed()
+    {
+      self.auto_start_log = log;
+    }
+    Self::settings_hint(ui, "Log opens collapsed. Disable to keep it closed at startup.");
+
+    ui.label(
+      egui::RichText::new("Changes apply on next start. Save config to keep them.")
+        .small()
+        .weak(),
+    );
   }
 
   fn draw_settings_tab_core(
@@ -5349,7 +5411,7 @@ impl KeyHunterApp {
             .width(100.0)
             .selected_text(b.to_string())
             .show_ui(ui, |ui| {
-              for &v in &[32u32, 64, 128, 256, 512] {
+              for &v in BLOCK_SIZES {
                 ui.selectable_value(&mut b, v, v.to_string());
               }
             });
@@ -5361,7 +5423,7 @@ impl KeyHunterApp {
             .width(100.0)
             .selected_text(g.to_string())
             .show_ui(ui, |ui| {
-              for &v in &[16u32, 32, 64, 128, 256, 512, 1024] {
+              for &v in GRID_SIZES {
                 ui.selectable_value(&mut g, v, v.to_string());
               }
             });
@@ -5376,7 +5438,7 @@ impl KeyHunterApp {
             .width(100.0)
             .selected_text(c.to_string())
             .show_ui(ui, |ui| {
-              for &v in &[1u32, 2, 4, 8, 16] {
+              for &v in CHUNK_MULTIPLIERS {
                 ui.selectable_value(&mut c, v, v.to_string());
               }
             });
@@ -5486,6 +5548,7 @@ impl KeyHunterApp {
     egui::Window::new("Help  (F1)")
       .open(&mut open)
       .collapsible(true)
+      .default_open(false)
       .resizable(true)
       .default_size([560.0, 520.0])
       .show(ctx, |ui| {
