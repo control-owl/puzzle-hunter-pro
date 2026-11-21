@@ -39,12 +39,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
-pub const DEVELOPER_GPG_FINGERPRINT: &str = "C88E6F25736AD83DA1C757B22524C8FEB60EFCB0";
-pub const DEVELOPER_GPG_PUBLIC_KEY: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/cert/Control_Owl_public.asc"));
-pub const PACKAGE_MAGIC: &[u8] = b"CTRLOWL";
 const HEADER_LEN: usize = 43;
 const APP_SALT: &[u8] = b"CTRLOWL-PUZZLE-HUNTER-PRO-v1";
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+pub const DEVELOPER_GPG_FINGERPRINT: &str = "C88E6F25736AD83DA1C757B22524C8FEB60EFCB0";
+pub const DEVELOPER_GPG_PUBLIC_KEY: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/cert/Control_Owl_public.asc"));
+pub const PACKAGE_MAGIC: &[u8] = b"CTRLOWL";
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
 #[derive(Clone, Debug)]
 pub struct LoadedPackage {
@@ -103,11 +105,37 @@ impl std::fmt::Display for PackageError {
 
 impl std::error::Error for PackageError {}
 
+#[derive(Clone, Debug, Default)]
+pub struct GpuInfo {
+  pub uuid: String,
+  pub name: String,
+  pub compute_cap: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MachineReport {
+  pub fingerprint_hex: String,
+  pub fingerprint_sources: Vec<String>,
+  pub gpus: Vec<GpuInfo>,
+  pub os: String,
+  pub cpu: String,
+  pub app_version: String,
+}
+
+mod hostname {
+  pub fn get() -> Result<std::ffi::OsString, ()> {
+    std::env::var_os("HOSTNAME").or_else(|| std::env::var_os("COMPUTERNAME")).ok_or(())
+  }
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
 fn is_usable_dmi(t: &str) -> bool {
   if t.is_empty() {
     return false;
   }
-  matches!(
+
+  !matches!(
     t,
     "None"
       | "ToBeFilledByO.E.M."
@@ -119,19 +147,18 @@ fn is_usable_dmi(t: &str) -> bool {
       | "SystemSerialNumber"
       | "0123456789"
       | "123456789"
-  ) == false
+  )
 }
 
 pub fn is_virtualized() -> bool {
   #[cfg(target_os = "linux")]
   {
-    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-      if cpuinfo
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo")
+      && cpuinfo
         .lines()
         .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"))
-      {
-        return true;
-      }
+    {
+      return true;
     }
 
     for path in [
@@ -158,10 +185,10 @@ pub fn is_virtualized() -> bool {
       }
     }
 
-    if let Ok(out) = Command::new("systemd-detect-virt").arg("--quiet").output() {
-      if out.status.success() {
-        return true;
-      }
+    if let Ok(out) = Command::new("systemd-detect-virt").arg("--quiet").output()
+      && out.status.success()
+    {
+      return true;
     }
   }
 
@@ -375,13 +402,14 @@ fn collect_stable_ids() -> Vec<String> {
     }
   }
 
-  if let Ok(out) = Command::new("nvidia-smi").args(["--query-gpu=uuid", "--format=csv,noheader"]).output() {
-    if out.status.success() {
-      for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let u: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-        if !u.is_empty() && u.len() > 8 {
-          ids.push(format!("nvidia-gpu-uuid:{}", u));
-        }
+  if let Ok(out) = Command::new("nvidia-smi").args(["--query-gpu=uuid", "--format=csv,noheader"]).output()
+    && out.status.success()
+  {
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+      let u: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+
+      if !u.is_empty() && u.len() > 8 {
+        ids.push(format!("nvidia-gpu-uuid:{}", u));
       }
     }
   }
@@ -431,23 +459,6 @@ pub fn compute_machine_fingerprint() -> [u8; 32] {
 
 pub fn compute_machine_fingerprint_hex() -> String {
   compute_machine_fingerprint().iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GpuInfo {
-  pub uuid: String,
-  pub name: String,
-  pub compute_cap: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct MachineReport {
-  pub fingerprint_hex: String,
-  pub fingerprint_sources: Vec<String>,
-  pub gpus: Vec<GpuInfo>,
-  pub os: String,
-  pub cpu: String,
-  pub app_version: String,
 }
 
 pub fn collect_machine_report() -> MachineReport {
@@ -1013,8 +1024,4 @@ fn split_signature(data: &[u8]) -> Result<(&[u8], Option<Vec<u8>>), PackageError
   Ok((data, None))
 }
 
-mod hostname {
-  pub fn get() -> Result<std::ffi::OsString, ()> {
-    std::env::var_os("HOSTNAME").or_else(|| std::env::var_os("COMPUTERNAME")).ok_or(())
-  }
-}
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..

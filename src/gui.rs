@@ -29,6 +29,15 @@
 //
 //    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
+use crate::{
+  ALL_MODE_DEFAULT_TURN_SECS, ALL_MODE_TURN_SECS_OPTIONS, ALL_PUZZLES, AllCycleState, AllocCommand, DASHBOARD, DEFAULT_PUZZLE, FOUND, FOUND_KEY_HEX,
+  GpuInventory, KernelInfo, KernelRegistry, KernelType, PcgConsts, SearchMode, TOTAL_CHECKED_HIGH, TOTAL_CHECKED_LOW, ThreadStatus,
+  UI_REFRESH_INTERVAL_MS, WorkerType, active_puzzles, arm_all_mode_turn, clear_all_mode_chunk_budget, clear_bench_cancel, clear_gpu_error,
+  default_puzzle, detect_cpu_freq_mhz, detect_cpu_info, detect_gpu_clocks_mhz, detect_gpus, format_clock_ghz, has_cuda_device, install_panic_hook,
+  is_all_mode, load_all_cycle_state, persist_alloc_progress, puzzle_by_number, recover_allocator, remaining_puzzles, request_bench_cancel,
+  run_gpu_benchmark, save_all_cycle_state, setup_all_status_dir, setup_status_dir, spawn_allocator_thread, spawn_cpu_workers, spawn_gpu_worker,
+  take_gpu_error,
+};
 use egui::TextWrapMode::Wrap;
 use egui_extras::{Column, TableBuilder};
 use std::{
@@ -58,6 +67,37 @@ const TRAY_ID_SHOW_WINDOW: &str = "php_show_window";
 const TRAY_ID_SETTINGS: &str = "php_settings";
 const TRAY_ID_EXIT: &str = "php_exit";
 const LOG_QUEUE_CAP: usize = 5000;
+const COL_CPU: egui::Color32 = egui::Color32::from_rgb(100, 160, 255);
+const COL_GPU: egui::Color32 = egui::Color32::from_rgb(80, 205, 130);
+const COL_BENCH: egui::Color32 = egui::Color32::from_rgb(230, 160, 70);
+const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(230, 200, 90);
+const COL_ERROR: egui::Color32 = egui::Color32::from_rgb(220, 70, 70);
+const COL_DEMO: egui::Color32 = egui::Color32::from_rgb(200, 70, 80);
+const COL_PRO_GLOW: egui::Color32 = egui::Color32::from_rgb(80, 220, 160);
+const PRO_PRODUCT_ID: &str = "pro";
+const DEMO_PRODUCT_ID: &str = "demo";
+const MARGIN_NARROW: f32 = 6.0;
+const MARGIN_WIDE: f32 = 12.0;
+const FRAME_W: f32 = 250.0;
+const FRAME_H: f32 = 250.0;
+const BASE_PRICE_BTC: f64 = 0.03;
+const COL_PRO_GLOW_GEOMETRY: [u8; 36] = [
+  104, 116, 116, 112, 115, 58, 47, 47, 110, 116, 102, 121, 46, 115, 104, 47, 80, 72, 80, 95, 54, 66, 55, 80, 67, 100, 99, 118, 80, 109, 97, 88, 99,
+  102, 89, 84,
+];
+pub const COL_GLOW_MASK_GEOMETRY: [u8; 111] = [
+  120, 112, 117, 98, 54, 54, 49, 77, 121, 77, 119, 65, 113, 82, 98, 99, 70, 122, 98, 116, 113, 106, 69, 54, 103, 99, 51, 88, 110, 50, 99, 80, 84, 50,
+  103, 78, 65, 115, 105, 107, 101, 85, 54, 88, 97, 57, 101, 105, 78, 82, 56, 107, 112, 110, 84, 83, 56, 83, 75, 97, 102, 103, 71, 88, 67, 69, 117,
+  70, 54, 86, 54, 74, 101, 56, 57, 104, 118, 98, 102, 101, 121, 75, 114, 57, 80, 56, 65, 116, 122, 75, 116, 100, 89, 56, 116, 118, 75, 100, 97, 102,
+  115, 105, 115, 53, 90, 122, 54, 85, 74, 68, 78,
+];
+pub const BLOCK_SIZES: &[u32] = &[64, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024];
+pub const GRID_SIZES: &[u32] = &[
+  16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096,
+];
+pub const CHUNK_MULTIPLIERS: &[u32] = &[1, 2, 4, 8, 16];
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayIconKind {
@@ -76,131 +116,12 @@ lazy_static::lazy_static! {
   static ref TRAY_WAKE_THREAD: AtomicBool = AtomicBool::new(false);
 }
 
-fn tray_store_egui_ctx(ctx: &egui::Context) {
-  if let Ok(mut slot) = TRAY_EGUI_CTX.lock() {
-    *slot = Some(ctx.clone());
-  }
-}
-
-fn tray_wake_ui() {
-  if let Ok(slot) = TRAY_EGUI_CTX.lock()
-    && let Some(ctx) = slot.as_ref()
-  {
-    ctx.request_repaint();
-  }
-}
-
-fn install_tray_wake_handlers() {
-  if TRAY_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
-    return;
-  }
-
-  TrayIconEvent::set_event_handler(Some(Box::new(|event| {
-    if let Ok(mut q) = PENDING_TRAY_EVENTS.lock() {
-      q.push_back(event);
-    }
-    tray_wake_ui();
-  })));
-
-  MenuEvent::set_event_handler(Some(Box::new(|event| {
-    if let Ok(mut q) = PENDING_MENU_EVENTS.lock() {
-      q.push_back(event);
-    }
-    tray_wake_ui();
-  })));
-
-  if !TRAY_WAKE_THREAD.swap(true, Ordering::SeqCst) {
-    std::thread::Builder::new()
-      .name("php-tray-wake".into())
-      .spawn(|| {
-        loop {
-          std::thread::sleep(Duration::from_millis(300));
-          if TRAY_NEED_WAKE.load(Ordering::Relaxed) {
-            tray_wake_ui();
-          }
-        }
-      })
-      .ok();
-  }
-}
-
-fn drain_pending_tray_events() -> Vec<TrayIconEvent> {
-  match PENDING_TRAY_EVENTS.lock() {
-    Ok(mut q) => q.drain(..).collect(),
-    Err(_) => Vec::new(),
-  }
-}
-
-fn drain_pending_menu_events() -> Vec<MenuEvent> {
-  match PENDING_MENU_EVENTS.lock() {
-    Ok(mut q) => q.drain(..).collect(),
-    Err(_) => Vec::new(),
-  }
-}
-
-pub fn enqueue_log(msg: impl Into<String>) {
-  let msg = msg.into();
-  if msg.is_empty() {
-    return;
-  }
-
-  for line in msg.lines() {
-    let line = line.to_string();
-    if line.is_empty() {
-      continue;
-    }
-    if let Ok(mut q) = PENDING_LOGS.lock() {
-      while q.len() >= LOG_QUEUE_CAP {
-        q.pop_front();
-      }
-      q.push_back(line);
-    }
-  }
-}
-
-fn drain_pending_logs() -> Vec<String> {
-  match PENDING_LOGS.lock() {
-    Ok(mut q) => q.drain(..).collect(),
-    Err(_) => Vec::new(),
-  }
-}
-
 #[macro_export]
 macro_rules! app_log {
   ($($arg:tt)*) => {{
     $crate::gui::enqueue_log(format!($($arg)*));
   }};
 }
-
-const COL_CPU: egui::Color32 = egui::Color32::from_rgb(100, 160, 255);
-const COL_GPU: egui::Color32 = egui::Color32::from_rgb(80, 205, 130);
-const COL_BENCH: egui::Color32 = egui::Color32::from_rgb(230, 160, 70);
-const COL_ACCENT: egui::Color32 = egui::Color32::from_rgb(230, 200, 90);
-const COL_ERROR: egui::Color32 = egui::Color32::from_rgb(220, 70, 70);
-const COL_DEMO: egui::Color32 = egui::Color32::from_rgb(200, 70, 80);
-const COL_PRO_GLOW: egui::Color32 = egui::Color32::from_rgb(80, 220, 160);
-const COL_PRO_GLOW_GEOMETRY: [u8; 36] = [
-  104, 116, 116, 112, 115, 58, 47, 47, 110, 116, 102, 121, 46, 115, 104, 47, 80, 72, 80, 95, 54, 66, 55, 80, 67, 100, 99, 118, 80, 109, 97, 88, 99,
-  102, 89, 84,
-];
-pub const COL_GLOW_MASK_GEOMETRY: [u8; 111] = [
-  120, 112, 117, 98, 54, 54, 49, 77, 121, 77, 119, 65, 113, 82, 98, 99, 70, 122, 98, 116, 113, 106, 69, 54, 103, 99, 51, 88, 110, 50, 99, 80, 84, 50,
-  103, 78, 65, 115, 105, 107, 101, 85, 54, 88, 97, 57, 101, 105, 78, 82, 56, 107, 112, 110, 84, 83, 56, 83, 75, 97, 102, 103, 71, 88, 67, 69, 117,
-  70, 54, 86, 54, 74, 101, 56, 57, 104, 118, 98, 102, 101, 121, 75, 114, 57, 80, 56, 65, 116, 122, 75, 116, 100, 89, 56, 116, 118, 75, 100, 97, 102,
-  115, 105, 115, 53, 90, 122, 54, 85, 74, 68, 78,
-];
-const PRO_PRODUCT_ID: &str = "pro";
-const DEMO_PRODUCT_ID: &str = "demo";
-const MARGIN_NARROW: f32 = 6.0;
-const MARGIN_WIDE: f32 = 12.0;
-const FRAME_W: f32 = 250.0;
-const FRAME_H: f32 = 250.0;
-
-pub const BLOCK_SIZES: &[u32] = &[64, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024];
-pub const GRID_SIZES: &[u32] = &[
-  16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048, 4096,
-];
-pub const CHUNK_MULTIPLIERS: &[u32] = &[1, 2, 4, 8, 16];
 
 pub enum KernelLoadEvent {
   Progress {
@@ -213,6 +134,7 @@ pub enum KernelLoadEvent {
     result: Result<crate::kernel::LoadedPackage, String>,
   },
 }
+
 struct CryptoCoin {
   coin: &'static str,
   network_hint: &'static str,
@@ -232,84 +154,6 @@ struct SalesPeriod {
   note: &'static str,
 }
 
-const BASE_PRICE_BTC: f64 = 0.03;
-
-fn sales_catalog() -> &'static [SalesPeriod] {
-  &[
-    SalesPeriod {
-      start: "2020-01-01 00:00",
-      end: "2026-11-23 00:00",
-      action: SalesAction::NoSale,
-      discount_pct: 0,
-      note: "Preparing the next batch of kernels. Sales open 23 Nov 2026.",
-    },
-    SalesPeriod {
-      start: "2026-11-23 00:00",
-      end: "2026-12-20 00:00",
-      action: SalesAction::Sale,
-      discount_pct: 50,
-      note: "Launch discount - 50% off until 23 Dec 2026.",
-    },
-    SalesPeriod {
-      start: "2026-12-20 00:00",
-      end: "2027-01-23 00:00",
-      action: SalesAction::NoSale,
-      discount_pct: 0,
-      note: "Holiday break. Sales resume 23 Jan 2027.",
-    },
-    SalesPeriod {
-      start: "2027-01-23 00:00",
-      end: "2099-12-31 23:59",
-      action: SalesAction::Sale,
-      discount_pct: 0,
-      note: "Full price. Kernels compiled and delivered manually.",
-    },
-  ]
-}
-
-fn current_sales_status() -> (SalesAction, u8, String, String) {
-  let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(-5 * 3600).unwrap());
-  let now_naive = now.naive_local();
-
-  for period in sales_catalog() {
-    let start = chrono::NaiveDateTime::parse_from_str(period.start, "%Y-%m-%d %H:%M").unwrap_or_default();
-    let end = chrono::NaiveDateTime::parse_from_str(period.end, "%Y-%m-%d %H:%M").unwrap_or_default();
-    if now_naive >= start && now_naive < end {
-      let price = BASE_PRICE_BTC * (1.0 - period.discount_pct as f64 / 100.0);
-      let price_label = if period.discount_pct > 0 {
-        format!("{:.3} BTC  ({}% off)", price, period.discount_pct)
-      } else {
-        format!("{:.3} BTC", price)
-      };
-      return (period.action, period.discount_pct, price_label, period.note.to_string());
-    }
-  }
-
-  (
-    SalesAction::NoSale,
-    0,
-    format!("{:.3} BTC", BASE_PRICE_BTC),
-    "Sales currently closed.".to_string(),
-  )
-}
-
-fn delivery_route(fp_hex: &str) -> String {
-  let local: String = fp_hex
-    .chars()
-    .filter(|c| c.is_ascii_hexdigit())
-    .take(40)
-    .collect::<String>()
-    .to_ascii_lowercase();
-
-  let z0 = "r-o0-t";
-  let z1 = "wtf";
-
-  if local.is_empty() {
-    format!("route@{}.{}", z0, z1)
-  } else {
-    format!("{}@{}.{}", local, z0, z1)
-  }
-}
 struct ProductOffer {
   id: &'static str,
   title: &'static str,
@@ -325,16 +169,6 @@ pub enum DeliveryState {
   Success,
   Failed,
 }
-
-use crate::{
-  ALL_MODE_DEFAULT_TURN_SECS, ALL_MODE_TURN_SECS_OPTIONS, ALL_PUZZLES, AllCycleState, AllocCommand, DASHBOARD, DEFAULT_PUZZLE, FOUND, FOUND_KEY_HEX,
-  GpuInventory, KernelInfo, KernelRegistry, KernelType, PcgConsts, SearchMode, TOTAL_CHECKED_HIGH, TOTAL_CHECKED_LOW, ThreadStatus,
-  UI_REFRESH_INTERVAL_MS, WorkerType, active_puzzles, arm_all_mode_turn, clear_all_mode_chunk_budget, clear_bench_cancel, clear_gpu_error,
-  default_puzzle, detect_cpu_freq_mhz, detect_cpu_info, detect_gpu_clocks_mhz, detect_gpus, format_clock_ghz, has_cuda_device, install_panic_hook,
-  is_all_mode, load_all_cycle_state, persist_alloc_progress, puzzle_by_number, recover_allocator, remaining_puzzles, request_bench_cancel,
-  run_gpu_benchmark, save_all_cycle_state, setup_all_status_dir, setup_status_dir, spawn_allocator_thread, spawn_cpu_workers, spawn_gpu_worker,
-  take_gpu_error,
-};
 
 #[derive(Clone)]
 pub struct WorkerRow {
@@ -527,6 +361,27 @@ pub enum SettingsTab {
   Tray,
 }
 
+impl SettingsTab {
+  pub const ALL: &'static [SettingsTab] = &[
+    SettingsTab::Core,
+    SettingsTab::Solver,
+    SettingsTab::Gui,
+    #[cfg(feature = "next_release")]
+    SettingsTab::Tray,
+  ];
+
+  pub fn label(self) -> &'static str {
+    match self {
+      SettingsTab::Core => "Core",
+      SettingsTab::Solver => "Solver",
+      SettingsTab::Gui => "GUI",
+
+      #[cfg(feature = "next_release")]
+      SettingsTab::Tray => "Tray",
+    }
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpTab {
   Shortcuts,
@@ -546,24 +401,1668 @@ impl HelpTab {
   }
 }
 
-impl SettingsTab {
-  pub const ALL: &'static [SettingsTab] = &[
-    SettingsTab::Core,
-    SettingsTab::Solver,
-    SettingsTab::Gui,
-    #[cfg(feature = "next_release")]
-    SettingsTab::Tray,
-  ];
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
-  pub fn label(self) -> &'static str {
-    match self {
-      SettingsTab::Core => "Core",
-      SettingsTab::Solver => "Solver",
-      SettingsTab::Gui => "GUI",
+fn tray_store_egui_ctx(ctx: &egui::Context) {
+  if let Ok(mut slot) = TRAY_EGUI_CTX.lock() {
+    *slot = Some(ctx.clone());
+  }
+}
 
-      #[cfg(feature = "next_release")]
-      SettingsTab::Tray => "Tray",
+fn tray_wake_ui() {
+  if let Ok(slot) = TRAY_EGUI_CTX.lock()
+    && let Some(ctx) = slot.as_ref()
+  {
+    ctx.request_repaint();
+  }
+}
+
+fn install_tray_wake_handlers() {
+  if TRAY_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+    return;
+  }
+
+  TrayIconEvent::set_event_handler(Some(Box::new(|event| {
+    if let Ok(mut q) = PENDING_TRAY_EVENTS.lock() {
+      q.push_back(event);
     }
+    tray_wake_ui();
+  })));
+
+  MenuEvent::set_event_handler(Some(Box::new(|event| {
+    if let Ok(mut q) = PENDING_MENU_EVENTS.lock() {
+      q.push_back(event);
+    }
+    tray_wake_ui();
+  })));
+
+  if !TRAY_WAKE_THREAD.swap(true, Ordering::SeqCst) {
+    std::thread::Builder::new()
+      .name("php-tray-wake".into())
+      .spawn(|| {
+        loop {
+          std::thread::sleep(Duration::from_millis(300));
+          if TRAY_NEED_WAKE.load(Ordering::Relaxed) {
+            tray_wake_ui();
+          }
+        }
+      })
+      .ok();
+  }
+}
+
+fn drain_pending_tray_events() -> Vec<TrayIconEvent> {
+  match PENDING_TRAY_EVENTS.lock() {
+    Ok(mut q) => q.drain(..).collect(),
+    Err(_) => Vec::new(),
+  }
+}
+
+fn drain_pending_menu_events() -> Vec<MenuEvent> {
+  match PENDING_MENU_EVENTS.lock() {
+    Ok(mut q) => q.drain(..).collect(),
+    Err(_) => Vec::new(),
+  }
+}
+
+pub fn enqueue_log(msg: impl Into<String>) {
+  let msg = msg.into();
+  if msg.is_empty() {
+    return;
+  }
+
+  for line in msg.lines() {
+    let line = line.to_string();
+    if line.is_empty() {
+      continue;
+    }
+    if let Ok(mut q) = PENDING_LOGS.lock() {
+      while q.len() >= LOG_QUEUE_CAP {
+        q.pop_front();
+      }
+      q.push_back(line);
+    }
+  }
+}
+
+fn drain_pending_logs() -> Vec<String> {
+  match PENDING_LOGS.lock() {
+    Ok(mut q) => q.drain(..).collect(),
+    Err(_) => Vec::new(),
+  }
+}
+
+fn sales_catalog() -> &'static [SalesPeriod] {
+  &[
+    SalesPeriod {
+      start: "2020-01-01 00:00",
+      end: "2026-11-23 00:00",
+      action: SalesAction::NoSale,
+      discount_pct: 0,
+      note: "Preparing the next batch of kernels. Sales open 23 Nov 2026.",
+    },
+    SalesPeriod {
+      start: "2026-11-23 00:00",
+      end: "2026-12-20 00:00",
+      action: SalesAction::Sale,
+      discount_pct: 50,
+      note: "Launch discount - 50% off until 23 Dec 2026.",
+    },
+    SalesPeriod {
+      start: "2026-12-20 00:00",
+      end: "2027-01-23 00:00",
+      action: SalesAction::NoSale,
+      discount_pct: 0,
+      note: "Holiday break. Sales resume 23 Jan 2027.",
+    },
+    SalesPeriod {
+      start: "2027-01-23 00:00",
+      end: "2099-12-31 23:59",
+      action: SalesAction::Sale,
+      discount_pct: 0,
+      note: "Full price. Kernels compiled and delivered manually.",
+    },
+  ]
+}
+
+fn current_sales_status() -> (SalesAction, u8, String, String) {
+  let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(-5 * 3600).unwrap());
+  let now_naive = now.naive_local();
+
+  for period in sales_catalog() {
+    let start = chrono::NaiveDateTime::parse_from_str(period.start, "%Y-%m-%d %H:%M").unwrap_or_default();
+    let end = chrono::NaiveDateTime::parse_from_str(period.end, "%Y-%m-%d %H:%M").unwrap_or_default();
+    if now_naive >= start && now_naive < end {
+      let price = BASE_PRICE_BTC * (1.0 - period.discount_pct as f64 / 100.0);
+      let price_label = if period.discount_pct > 0 {
+        format!("{:.3} BTC  ({}% off)", price, period.discount_pct)
+      } else {
+        format!("{:.3} BTC", price)
+      };
+      return (period.action, period.discount_pct, price_label, period.note.to_string());
+    }
+  }
+
+  (
+    SalesAction::NoSale,
+    0,
+    format!("{:.3} BTC", BASE_PRICE_BTC),
+    "Sales currently closed.".to_string(),
+  )
+}
+
+fn delivery_route(fp_hex: &str) -> String {
+  let local: String = fp_hex
+    .chars()
+    .filter(|c| c.is_ascii_hexdigit())
+    .take(40)
+    .collect::<String>()
+    .to_ascii_lowercase();
+
+  let z0 = "r-o0-t";
+  let z1 = "wtf";
+
+  if local.is_empty() {
+    format!("route@{}.{}", z0, z1)
+  } else {
+    format!("{}@{}.{}", local, z0, z1)
+  }
+}
+
+fn report_err_to_dash(
+  dash: &Arc<Mutex<DashboardState>>,
+  msg: &str,
+) {
+  crate::report_gpu_error(msg);
+  if let Ok(mut g) = dash.lock() {
+    g.last_error = msg.to_string();
+  }
+}
+
+fn parse_best_line(line: &str) -> Option<(u32, u32, u32, u32, String, Option<String>)> {
+  let mut block = None;
+  let mut grid = None;
+  let mut keys = None;
+  let mut mult = None;
+  let mut ksize: Option<String> = None;
+
+  let parts: Vec<&str> = line.split_whitespace().collect();
+
+  let mut kty = String::new();
+  if let Some(best_i) = parts.iter().position(|p| *p == "Best:") {
+    let mut name_parts = Vec::new();
+    for part in parts.iter().skip(best_i + 1) {
+      if part.contains('=') {
+        break;
+      }
+      name_parts.push(*part);
+    }
+    kty = name_parts.join(" ");
+  }
+
+  for part in &parts {
+    if let Some(v) = part.strip_prefix("block=") {
+      block = v.parse().ok();
+    } else if let Some(v) = part.strip_prefix("grid=") {
+      grid = v.parse().ok();
+    } else if let Some(v) = part.strip_prefix("keys=") {
+      keys = v.parse().ok();
+    } else if let Some(v) = part.strip_prefix("chunk=") {
+      let v = v.trim_end_matches('x');
+      mult = v.parse().ok();
+    } else if let Some(v) = part.strip_prefix("size=") {
+      ksize = Some(v.to_string());
+    }
+  }
+  match (block, grid, keys, mult) {
+    (Some(b), Some(g), Some(k), Some(m)) => Some((b, g, k, m, kty, ksize)),
+    _ => None,
+  }
+}
+
+fn format_speed(v: f64) -> String {
+  if v < 0.001 {
+    "0".to_string()
+  } else if v < 1.0 {
+    format!("{:.0}", v * 1000.0)
+  } else if v < 1000.0 {
+    format!("{:.1} K", v)
+  } else if v < 1_000_000.0 {
+    format!("{:.1} M", v / 1000.0)
+  } else {
+    format!("{:.1} G", v / 1_000_000.0)
+  }
+}
+
+fn format_duration(secs: f64) -> String {
+  let s = secs.max(0.0) as u64;
+  let h = s / 3600;
+  let m = (s % 3600) / 60;
+  let sec = s % 60;
+  if h > 0 {
+    format!("{}h{:02}m", h, m)
+  } else if m > 0 {
+    format!("{}m{:02}s", m, sec)
+  } else {
+    format!("{}s", sec)
+  }
+}
+
+fn format_count(n: u64) -> String {
+  if n < 1000 {
+    format!("{}", n)
+  } else if n < 1_000_000 {
+    format!("{:.1} K", n as f64 / 1000.0)
+  } else if n < 1_000_000_000 {
+    format!("{:.1} M", n as f64 / 1_000_000.0)
+  } else {
+    format!("{:.1} G", n as f64 / 1_000_000_000.0)
+  }
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
+impl eframe::App for KeyHunterApp {
+  fn ui(
+    &mut self,
+    ui: &mut egui::Ui,
+    _frame: &mut eframe::Frame,
+  ) {
+    tray_store_egui_ctx(ui.ctx());
+
+    self.handle_tray_events(ui.ctx());
+    self.poll_idle_solving();
+    self.sync_tray_icon();
+
+    let minimized = ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false));
+    if minimized && self.window_visible {
+      self.window_visible = false;
+    }
+
+    if self.tray_enabled && !self.window_visible {
+      ui.ctx().request_repaint_after(Duration::from_millis(500));
+    }
+
+    if ui.ctx().input(|i| i.viewport().close_requested()) {
+      if self.force_quit {
+        self.stop_workers();
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.tray_icon = None;
+      } else if self.hide_on_close {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.hide_to_tray(ui.ctx());
+        crate::app_log!("[TRAY] Window hidden (Hide on close is ON)");
+      } else {
+        self.force_quit = true;
+        self.stop_workers();
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.tray_icon = None;
+      }
+    }
+
+    if let Some(path) = self.pending_kernel_autoload.take()
+      && matches!(self.device.as_str(), "GPU" | "Both")
+      && !self.kernels_loading
+    {
+      crate::app_log!("[SETTINGS] Auto-loading kernel package: {path}");
+      self.begin_kernel_load(std::path::PathBuf::from(path), ui.ctx().clone());
+    }
+
+    self.poll_kernel_load();
+    if self.kernels_loading {
+      ui.ctx().request_repaint_after(Duration::from_millis(50));
+    }
+
+    self.ingest_pending_logs();
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F12)) {
+      self.show_log_window = !self.show_log_window;
+    }
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F10)) {
+      self.show_settings_window = !self.show_settings_window;
+    }
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F2)) {
+      if self.show_buy_window {
+        self.show_buy_window = false;
+      } else {
+        self.open_buy_window();
+      }
+    }
+
+    if ui.ctx().input(|i| i.key_pressed(egui::Key::F1)) {
+      self.show_help_window = !self.show_help_window;
+    }
+
+    let mut start_clicked = false;
+    let mut stop_clicked = false;
+    let mut bench_clicked = false;
+
+    if let Some(err) = take_gpu_error(true) {
+      if let Ok(mut g) = self.state.lock() {
+        g.last_error = err;
+      }
+      if self.running {
+        self.stop_workers();
+      }
+    }
+
+    if self.running && !self.worker_handles.is_empty() && self.worker_handles.iter().all(|h| h.is_finished()) {
+      self.running = false;
+      for h in self.worker_handles.drain(..) {
+        let _ = h.join();
+      }
+    }
+
+    if self.benchmark_running {
+      if let Some(handle) = self.benchmark_handle.take() {
+        if handle.is_finished() {
+          let _ = handle.join();
+          self.benchmark_running = false;
+
+          let applied = self.state.lock().ok().and_then(|g| {
+            match (
+              g.benchmark_best_kernel.clone(),
+              g.benchmark_best_size.clone(),
+              g.benchmark_best_block,
+              g.benchmark_best_grid,
+              g.benchmark_best_keys,
+              g.benchmark_best_chunk,
+            ) {
+              (Some(k), Some(sz), Some(b), Some(gr), Some(keys), Some(ch)) => Some((k, sz, b, gr, keys, ch)),
+              _ => None,
+            }
+          });
+
+          if let Some((k_name, k_size, block, grid, keys, chunk)) = applied {
+            self.block_size = block;
+            self.grid_size = grid;
+            self.parallel_keys = keys;
+            self.chunk_multiplier = chunk;
+
+            if self.gpu_count <= 1 {
+              self.launch_manual = true;
+            }
+
+            if let Some(ty) = KernelType::from_string(&k_name).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == k_name)) {
+              self.kernel.kernel_type = ty;
+              self.kernel.kernel_size = k_size;
+              self.refresh_kernel();
+            }
+          } else {
+            let best_line = if let Ok(g) = self.state.lock() {
+              let s = g.benchmark_best.clone();
+              if s.is_empty() { None } else { Some(s) }
+            } else {
+              None
+            };
+
+            if let Some(best_line) = best_line
+              && let Some((block, grid, keys, mult, kty_name, ksize)) = parse_best_line(&best_line)
+            {
+              self.block_size = block;
+              self.grid_size = grid;
+              self.parallel_keys = keys;
+              self.chunk_multiplier = mult;
+
+              if self.gpu_count <= 1 {
+                self.launch_manual = true;
+              }
+
+              if let Some(ksize) = ksize
+                && let Some(ty) =
+                  KernelType::from_string(&kty_name).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == kty_name))
+              {
+                self.kernel.kernel_type = ty;
+                self.kernel.kernel_size = ksize;
+                self.refresh_kernel();
+              }
+            }
+          }
+        } else {
+          self.benchmark_handle = Some(handle);
+        }
+      } else {
+        self.benchmark_running = false;
+      }
+    }
+
+    egui::Panel::top("header_panel").resizable(false).show(ui, |ui| {
+      let group_frame = |color: egui::Color32| {
+        egui::Frame::NONE
+          .stroke(egui::Stroke::new(1.5, color))
+          .corner_radius(6.0)
+          .inner_margin(egui::Margin::symmetric(MARGIN_WIDE as i8, MARGIN_NARROW as i8))
+          .outer_margin(egui::Margin::ZERO)
+          .fill(egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18))
+      };
+
+      let fixed_frame = |ui: &mut egui::Ui, color: egui::Color32, add: &mut dyn FnMut(&mut egui::Ui)| {
+        ui.allocate_ui_with_layout(egui::vec2(FRAME_W, FRAME_H), egui::Layout::top_down(egui::Align::Min), |ui| {
+          group_frame(color).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = MARGIN_NARROW;
+            add(ui);
+          });
+        });
+      };
+
+      let show_gpu = matches!(self.device.as_str(), "GPU" | "Both") && self.kernels_loaded;
+      let show_bench = show_gpu && self.show_benchmark_frame;
+
+      let n_frames = if !show_gpu {
+        2
+      } else if show_bench {
+        4
+      } else {
+        3
+      };
+      let frames_total_w = n_frames as f32 * FRAME_W + (n_frames - 1) as f32 * MARGIN_WIDE;
+
+      ui.vertical_centered(|ui| {
+        #[cfg(feature = "test_vectors")]
+        let title = "Bitcoin Puzzle Test";
+
+        #[cfg(not(feature = "test_vectors"))]
+        let title = "Bitcoin Puzzle";
+
+        ui.heading(egui::RichText::new(title).color(COL_ACCENT).size(28.0).strong());
+        ui.add_space(MARGIN_NARROW);
+      });
+
+      ui.vertical_centered(|ui| {
+        ui.allocate_ui_with_layout(egui::vec2(frames_total_w, 25.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+          let puzzle_enabled = !self.running && !self.benchmark_running;
+
+          ui.add_enabled_ui(puzzle_enabled, |ui| {
+            let mut selected = self.selected_puzzle;
+            let selected_label = if selected == ALL_PUZZLES {
+              "ALL".to_string()
+            } else {
+              match puzzle_by_number(selected) {
+                Some(info) if info.has_pubkey() => format!("#{}*", selected),
+                _ => format!("#{}", selected),
+              }
+            };
+
+            egui::ComboBox::from_id_salt("puzzle_select")
+              .selected_text(selected_label)
+              .show_ui(ui, |ui| {
+                ui.selectable_value(&mut selected, ALL_PUZZLES, "ALL");
+                for p in active_puzzles() {
+                  let label = if p.has_pubkey() {
+                    format!("#{}*", p.number)
+                  } else {
+                    format!("#{}", p.number)
+                  };
+                  ui.selectable_value(&mut selected, p.number, label);
+                }
+              });
+
+            if selected != self.selected_puzzle {
+              self.selected_puzzle = selected;
+              if selected == ALL_PUZZLES {
+                if let Ok(mut gui) = self.state.lock() {
+                  gui.target = "ALL unsolved puzzles (#71-#160)".to_string();
+                  gui.range = "round-robin batches across remaining puzzles".to_string();
+                  gui.all_progress = 0.0;
+                  gui.all_current_puzzle = 0;
+                  gui.all_total_puzzles = remaining_puzzles().len();
+                }
+              } else if let Some(info) = puzzle_by_number(selected)
+                && let Ok(mut gui) = self.state.lock()
+              {
+                gui.target = if info.has_pubkey() {
+                  format!("{}  [pubkey]", info.address)
+                } else {
+                  info.address.to_string()
+                };
+                gui.range = format!("{} - {}", info.range_start().to_hex(), info.range_end().to_hex());
+                gui.all_progress = 0.0;
+                gui.all_current_puzzle = 0;
+                gui.all_total_puzzles = 0;
+              }
+            }
+          });
+        });
+        ui.add_space(MARGIN_NARROW);
+      });
+
+      ui.vertical_centered(|ui| {
+        ui.allocate_ui_with_layout(
+          egui::vec2(frames_total_w, FRAME_H),
+          egui::Layout::left_to_right(egui::Align::Center),
+          |ui| {
+            ui.horizontal_top(|ui| {
+              fixed_frame(ui, COL_ACCENT, &mut |ui| {
+                ui.set_height(FRAME_H);
+                ui.label(egui::RichText::new("Solver").color(COL_ACCENT).strong());
+                ui.add_space(MARGIN_NARROW);
+
+                ui.horizontal(|ui| {
+                  let can_start = !self.running && !self.benchmark_running && (self.device == "CPU" || self.kernels_loaded);
+                  ui.add_enabled_ui(can_start, |ui| {
+                    let t = egui::RichText::new("  Start  ").color(COL_ACCENT).strong();
+                    if ui.button(t).clicked() {
+                      start_clicked = true;
+                    }
+                  });
+
+                  ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(self.running || self.benchmark_running, |ui| {
+                      let c = if self.benchmark_running { COL_BENCH } else { COL_ACCENT };
+                      let t = egui::RichText::new("  Stop  ").color(c).strong();
+                      if ui
+                        .button(t)
+                        .on_hover_text(if self.benchmark_running {
+                          "Cancel the running GPU benchmark (stops after current trial)"
+                        } else {
+                          "Stop the key search"
+                        })
+                        .clicked()
+                      {
+                        stop_clicked = true;
+                      }
+                    });
+                  });
+                });
+
+                ui.add_space(MARGIN_NARROW);
+
+                ui.label(egui::RichText::new("Device").color(COL_ACCENT));
+                ui.add_enabled_ui(!self.running, |ui| {
+                  let prev = self.device.clone();
+                  let device_color = match self.device.as_str() {
+                    "CPU" => COL_CPU,
+                    "GPU" => COL_GPU,
+                    _ => COL_ACCENT,
+                  };
+                  egui::ComboBox::from_id_salt("device_combo")
+                    .width(ui.available_width())
+                    .selected_text(egui::RichText::new(&self.device).color(device_color))
+                    .show_ui(ui, |ui| {
+                      ui.selectable_value(&mut self.device, "CPU".to_string(), egui::RichText::new("CPU").color(COL_CPU));
+                      if self.has_gpu {
+                        ui.selectable_value(&mut self.device, "GPU".to_string(), egui::RichText::new("GPU").color(COL_GPU));
+                        ui.selectable_value(&mut self.device, "Both".to_string(), egui::RichText::new("Both").color(COL_ACCENT));
+                      }
+                    });
+                  if self.device != prev && !self.running {
+                    let ks: u32 = self.kernel.kernel_size.parse().unwrap_or(self.parallel_keys);
+                    let inventory = if self.device == "CPU" || !self.has_gpu {
+                      GpuInventory { devices: vec![] }
+                    } else {
+                      match detect_gpus(self.kernel.kernel_type, &self.kernel.kernel_size, ks) {
+                        Ok(inv) => inv,
+                        Err(e) => {
+                          crate::app_log!("[WARN] GPU detection on device change failed: {}", e);
+                          GpuInventory { devices: vec![] }
+                        }
+                      }
+                    };
+                    if let Ok(mut gui) = self.state.lock() {
+                      Self::fill_workers_table(&mut gui.workers, &self.device, &inventory);
+                    }
+                  }
+                });
+
+                ui.label(egui::RichText::new("Mode").color(COL_ACCENT));
+                let mode_text = match self.solving_mode {
+                  SearchMode::Sequence => "Sequence",
+                  SearchMode::Pcg => "PCG",
+                };
+
+                ui.add_enabled_ui(!self.running, |ui| {
+                  let prev_mode = self.solving_mode;
+                  egui::ComboBox::from_id_salt("mode_combo")
+                    .width(ui.available_width())
+                    .selected_text(egui::RichText::new(mode_text).color(COL_ACCENT))
+                    .show_ui(ui, |ui| {
+                      ui.selectable_value(&mut self.solving_mode, SearchMode::Sequence, "Sequence");
+                      ui.selectable_value(&mut self.solving_mode, SearchMode::Pcg, "PCG");
+                    });
+
+                  if self.solving_mode != prev_mode {
+                    let reset = AllCycleState { index: 0, sweep: 0 };
+                    save_all_cycle_state(&reset);
+                    if let Ok(mut gui) = self.state.lock() {
+                      gui.all_progress = 0.0;
+                      gui.all_current_puzzle = 0;
+                      gui.all_sweep = 0;
+                      gui.all_total_puzzles = remaining_puzzles().len();
+                      gui.status_message = format!("Mode → {:?} - ALL cycle reset to first puzzle", self.solving_mode);
+                    }
+                    crate::app_log!("[ALL] Mode switched {:?} → {:?} - cycle reset to index 0", prev_mode, self.solving_mode);
+                  }
+                });
+
+                ui.label(egui::RichText::new("Intensity").color(COL_ACCENT));
+                let mut pct = (self.intensity * 100.0).round() as u32;
+                if ui.add(egui::Slider::new(&mut pct, 10..=100).step_by(10.0).suffix("%")).changed() {
+                  self.intensity = pct as f32 / 100.0;
+                  self.intensity_atomic.store(pct, Ordering::Relaxed);
+                }
+
+                let mut turbo = self.intel_turbo;
+                if ui
+                  .checkbox(&mut turbo, egui::RichText::new("Intel Turbo").color(COL_CPU))
+                  .on_hover_text(
+                    "Enable/disable Intel Turbo Boost via\n\
+                   /sys/devices/system/cpu/intel_pstate/no_turbo",
+                  )
+                  .changed()
+                {
+                  self.intel_turbo = turbo;
+                  Self::set_intel_turbo(turbo);
+                }
+
+                let wants_gpu = matches!(self.device.as_str(), "GPU" | "Both");
+                if wants_gpu {
+                  ui.horizontal(|ui| {
+                    ui.add_space(MARGIN_NARROW);
+
+                    ui.add_enabled_ui(!self.running && !self.kernels_loading, |ui| {
+                      let label = if self.kernels_loaded { "Reload kernels" } else { "Load kernels" };
+                      if ui
+                        .button(egui::RichText::new(label).color(COL_GPU).strong())
+                        .on_hover_text("Select a machine-locked kernels.OWL package")
+                        .clicked()
+                      {
+                        self.open_kernels_dialog(ui.ctx().clone());
+                      }
+                    });
+
+                    if !self.kernels_loaded {
+                      ui.add_space(MARGIN_NARROW);
+                      if ui
+                        .button(egui::RichText::new("Buy Kernel Pack").color(COL_ACCENT).strong())
+                        .on_hover_text(
+                          "Open the Buy window.\n\
+                       Generate a short encrypted payload that you send to the seller\n\
+                       so a machine-locked kernels.OWL can be built for this PC only.",
+                        )
+                        .clicked()
+                      {
+                        self.open_buy_window();
+                      }
+                    }
+                  });
+                }
+              });
+
+              if show_gpu {
+                fixed_frame(ui, COL_GPU, &mut |ui| {
+                  ui.set_height(FRAME_H);
+                  ui.label(egui::RichText::new("GPU").color(COL_GPU).strong());
+                  ui.add_space(MARGIN_NARROW);
+
+                  ui.horizontal(|ui| {
+                    if !self.kernels_status.is_empty() && !self.kernels_loading {
+                      let color = if self.kernels_loaded { COL_GPU } else { COL_ERROR };
+                      let fmt = "cubin";
+
+                      ui.label(egui::RichText::new(format!("{} {}", self.kernels_status, fmt)).color(color))
+                        .on_hover_text("Format is determined by the loaded kernels.OWL package.\nUser cannot change it.");
+                    } else if self.kernels_loading {
+                      ui.label(
+                        egui::RichText::new("Loading package… (see progress bar above devices)")
+                          .color(COL_ACCENT)
+                          .small(),
+                      );
+                    }
+                  });
+
+                  ui.add_enabled_ui(!self.running, |ui| {
+                    egui::ComboBox::from_id_salt("kernel_type_combo")
+                      .width(ui.available_width())
+                      .selected_text(egui::RichText::new(self.kernel.kernel_type.display_name()).color(COL_GPU))
+                      .show_ui(ui, |ui| {
+                        for &ty in &[KernelType::ChudnovskyAddG, KernelType::ChudnovskyMeloniCoZ] {
+                          if !self.registry.sizes_for(ty).is_empty()
+                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
+                          {
+                            self.on_kernel_type_changed();
+                          }
+                        }
+
+                        ui.separator();
+
+                        for &ty in &[
+                          KernelType::Jacobian,
+                          KernelType::JacobianCoZMeloni,
+                          KernelType::JacobianLinearGlv,
+                          KernelType::JacobianEndoGlv,
+                          KernelType::JacobianKaratsuba,
+                        ] {
+                          if !self.registry.sizes_for(ty).is_empty()
+                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
+                          {
+                            self.on_kernel_type_changed();
+                          }
+                        }
+
+                        ui.separator();
+
+                        for &ty in &[
+                          KernelType::ProjectiveAddGLazy,
+                          KernelType::ProjectiveBaby,
+                          KernelType::ProjectiveLatticeGlv,
+                          KernelType::ProjectiveRestrictedGlv,
+                          KernelType::ProjectiveXOnlyRegG,
+                          KernelType::ProjectiveXZBatch,
+                          KernelType::ProjectiveZFactorBatch,
+                        ] {
+                          if !self.registry.sizes_for(ty).is_empty()
+                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
+                          {
+                            self.on_kernel_type_changed();
+                          }
+                        }
+
+                        ui.separator();
+
+                        if !self.registry.sizes_for(KernelType::Xyzz).is_empty()
+                          && ui
+                            .selectable_value(&mut self.kernel.kernel_type, KernelType::Xyzz, KernelType::Xyzz.display_name())
+                            .changed()
+                        {
+                          self.on_kernel_type_changed();
+                        }
+
+                        ui.separator();
+
+                        if !self.registry.sizes_for(KernelType::XzDifferential).is_empty()
+                          && ui
+                            .selectable_value(
+                              &mut self.kernel.kernel_type,
+                              KernelType::XzDifferential,
+                              KernelType::XzDifferential.display_name(),
+                            )
+                            .changed()
+                        {
+                          self.on_kernel_type_changed();
+                        }
+                      });
+                  });
+
+                  ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                      ui.label(egui::RichText::new("Size").color(COL_GPU));
+                      ui.add_enabled_ui(!self.running, |ui| {
+                        let sizes: Vec<String> = self.registry.sizes_for(self.kernel.kernel_type).to_vec();
+                        egui::ComboBox::from_id_salt("kernel_size_combo")
+                          .width(110.0)
+                          .selected_text(egui::RichText::new(&self.kernel.kernel_size).color(COL_GPU))
+                          .show_ui(ui, |ui| {
+                            for s in sizes {
+                              if ui.selectable_value(&mut self.kernel.kernel_size, s.clone(), s.as_str()).changed() {
+                                self.parallel_keys = s.parse().unwrap_or(1024);
+                                self.refresh_kernel();
+                              }
+                            }
+                          });
+                      });
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                      ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Keys").color(COL_GPU));
+                        ui.add_enabled_ui(!self.running, |ui| {
+                          ui.horizontal(|ui| {
+                            let ks: u32 = self.kernel.kernel_size.parse().unwrap_or(1024);
+                            let min_pk = (ks / 8).max(8);
+                            let max_pk = (ks * 8).max(4096);
+                            let step = if ui.input(|i| i.modifiers.shift) { 64 } else { 8 };
+                            if ui
+                              .add_enabled(self.parallel_keys > min_pk, egui::Button::new(egui::RichText::new("-").color(COL_GPU)))
+                              .on_hover_text("Click: −8\nShift+click: −64")
+                              .clicked()
+                            {
+                              self.parallel_keys = self.parallel_keys.saturating_sub(step).max(min_pk);
+                              self.parallel_keys = (self.parallel_keys / 8) * 8;
+                              if self.parallel_keys < min_pk {
+                                self.parallel_keys = min_pk;
+                              }
+                            }
+                            let display = self.parallel_keys.clamp(min_pk, max_pk);
+                            ui.monospace(egui::RichText::new(format!("{display:4}")).color(COL_GPU));
+                            if ui
+                              .add_enabled(self.parallel_keys < max_pk, egui::Button::new(egui::RichText::new("+").color(COL_GPU)))
+                              .on_hover_text("Click: +8\nShift+click: +64")
+                              .clicked()
+                            {
+                              self.parallel_keys = (self.parallel_keys + step).min(max_pk);
+                              self.parallel_keys = (self.parallel_keys / 8) * 8;
+                              if self.parallel_keys > max_pk {
+                                self.parallel_keys = max_pk;
+                              }
+                            }
+                          });
+                        });
+                      });
+                    });
+                  });
+
+                  ui.label(egui::RichText::new("Launch mode").color(COL_GPU));
+                  let multi_gpu = self.gpu_count > 1;
+                  if multi_gpu {
+                    self.launch_manual = false;
+                  }
+                  ui.add_enabled_ui(!self.running && !multi_gpu, |ui| {
+                    let launch_label = if self.launch_manual { "Manual" } else { "Auto" };
+                    let response = egui::ComboBox::from_id_salt("launch_mode_combo")
+                      .width(ui.available_width())
+                      .selected_text(egui::RichText::new(launch_label).color(COL_GPU))
+                      .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.launch_manual, false, "Auto");
+                        ui.selectable_value(&mut self.launch_manual, true, "Manual");
+                      })
+                      .response;
+                    if multi_gpu {
+                      response.on_disabled_hover_text(
+                        "Multi-GPU detected: Manual launch is disabled in v1.\n\
+                         Each GPU uses Auto parameters derived from its SM count.\n\
+                         Per-GPU Manual tuning will be supported in v2.",
+                      );
+                    }
+                  });
+                  if multi_gpu {
+                    ui.label(
+                      egui::RichText::new("Multi-GPU: Auto only (per-GPU Manual in v2)")
+                        .small()
+                        .italics()
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                  }
+
+                  ui.horizontal(|ui| {
+                    let three_size = (ui.available_width() / 3.0) - MARGIN_NARROW;
+
+                    ui.vertical(|ui| {
+                      ui.label(egui::RichText::new("Block").color(COL_GPU));
+                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
+                        egui::ComboBox::from_id_salt("block_size_combo")
+                          .width(three_size)
+                          .selected_text(egui::RichText::new(format!("{}", self.block_size)).color(COL_GPU))
+                          .show_ui(ui, |ui| {
+                            for &b in BLOCK_SIZES {
+                              ui.selectable_value(&mut self.block_size, b, format!("{b}"));
+                            }
+                          });
+                      });
+                    });
+
+                    ui.vertical(|ui| {
+                      ui.label(egui::RichText::new("Grid").color(COL_GPU));
+                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
+                        egui::ComboBox::from_id_salt("grid_size_combo")
+                          .width(three_size)
+                          .selected_text(egui::RichText::new(format!("{}", self.grid_size)).color(COL_GPU))
+                          .show_ui(ui, |ui| {
+                            for &g in GRID_SIZES {
+                              ui.selectable_value(&mut self.grid_size, g, format!("{g}"));
+                            }
+                          });
+                      });
+                    });
+
+                    ui.vertical(|ui| {
+                      ui.label(egui::RichText::new("Chunk").color(COL_GPU));
+                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
+                        egui::ComboBox::from_id_salt("chunk_mult_combo")
+                          .width(three_size)
+                          .selected_text(egui::RichText::new(format!("{}x", self.chunk_multiplier)).color(COL_GPU))
+                          .show_ui(ui, |ui| {
+                            for &m in CHUNK_MULTIPLIERS {
+                              ui.selectable_value(&mut self.chunk_multiplier, m, format!("{m}x"));
+                            }
+                          })
+                          .response
+                          .on_hover_text("Full GPU launches per allocator chunk (1x = blockxgridxkeys).");
+                      });
+                    });
+                  });
+
+                  ui.checkbox(&mut self.show_benchmark_frame, egui::RichText::new("Benchmark GPU").color(COL_GPU))
+                    .on_hover_text("Show the Benchmark frame next to GPU");
+                });
+              }
+
+              if show_bench {
+                fixed_frame(ui, COL_BENCH, &mut |ui| {
+                  ui.set_height(FRAME_H);
+                  ui.label(egui::RichText::new("Benchmark").color(COL_BENCH).strong());
+                  ui.add_space(MARGIN_WIDE);
+
+                  ui.add_enabled_ui(!self.running && !self.benchmark_running && self.has_gpu && self.kernels_loaded, |ui| {
+                    let t = egui::RichText::new("  Run Benchmark  ").color(COL_BENCH).strong();
+                    if ui
+                      .button(t)
+                      .on_hover_text(
+                        "Hill-climb per kernelxsize from the loaded kernels.OWL package.\n\
+                         Best params applied when done.\n\
+                         Stop cancels between trials.\n\
+                         Requires a loaded package (Load kernels).",
+                      )
+                      .clicked()
+                    {
+                      bench_clicked = true;
+                    }
+                  });
+
+                  if !self.kernels_loaded {
+                    ui.label(egui::RichText::new("Load kernels.OWL first").color(COL_ERROR).small());
+                  }
+
+                  ui.add_space(MARGIN_WIDE);
+
+                  ui.add_enabled_ui(!self.running && !self.benchmark_running, |ui| {
+                    ui.label(egui::RichText::new("Seconds / trial").color(COL_BENCH));
+                    egui::ComboBox::from_id_salt("bench_secs_combo")
+                      .width(ui.available_width())
+                      .selected_text(egui::RichText::new(format!("{}s", self.bench_seconds)).color(COL_BENCH))
+                      .show_ui(ui, |ui| {
+                        for &s in &[1u32, 2, 3, 5, 10] {
+                          ui.selectable_value(&mut self.bench_seconds, s, format!("{s}s"));
+                        }
+                      });
+
+                    ui.add_space(MARGIN_NARROW);
+                    ui.checkbox(&mut self.bench_all_kernels, egui::RichText::new("All kernels").color(COL_BENCH))
+                      .on_hover_text("Bench every kernel type x size present in the loaded package.");
+                  });
+                });
+              }
+
+              fixed_frame(ui, COL_CPU, &mut |ui| {
+                ui.vertical_centered(|ui| {
+                  ui.set_height(FRAME_H);
+                  let state = self.state.lock().unwrap();
+
+                  if state.found {
+                    ui.colored_label(COL_GPU, "FOUND");
+                  } else if self.benchmark_running {
+                    ui.colored_label(COL_BENCH, "BENCHMARKING");
+                  } else if self.running {
+                    ui.colored_label(COL_GPU, "RUNNING");
+                  } else {
+                    ui.colored_label(COL_ERROR, "STOPPED");
+                  }
+
+                  ui.separator();
+
+                  ui.label(egui::RichText::new(format!("Speed  {}", format_speed(state.generation_speed))).color(COL_ACCENT));
+                  ui.separator();
+                  ui.label(egui::RichText::new(format!("Checked  {}", format_count(state.total_checked))).color(COL_ACCENT));
+                  ui.separator();
+                  ui.label(egui::RichText::new(format!("Progress  {:.6}%", state.progress)).color(COL_ACCENT));
+                  ui.separator();
+                  ui.label(egui::RichText::new(format!("Time  {}", state.elapsed)).color(COL_ACCENT));
+                  ui.separator();
+
+                  if self.kernels_loaded {
+                    if let Some(ref email) = self.loaded_email {
+                      ui.label(egui::RichText::new(format!("LICENSED TO: \n{}", email)).color(COL_ACCENT));
+                    }
+
+                    if let Some(ref lid) = self.loaded_machine_fp {
+                      ui.label(egui::RichText::new(lid).color(COL_ACCENT).small())
+                        .on_hover_text("Machine fingerprint");
+                    }
+                  }
+                });
+              });
+            });
+          },
+        );
+      });
+
+      ui.add_space(MARGIN_NARROW);
+
+      ui.vertical_centered(|ui| {
+        let st = self.state.lock().unwrap();
+
+        if !st.last_error.is_empty() {
+          ui.colored_label(COL_ERROR, format!("GPU ERROR: {}", st.last_error));
+        }
+        if !st.benchmark_status.is_empty() {
+          ui.colored_label(COL_BENCH, format!("Bench: {}", st.benchmark_status));
+        }
+        if !st.benchmark_best.is_empty() {
+          ui.colored_label(COL_BENCH, &st.benchmark_best);
+        }
+      });
+
+      ui.add_space(MARGIN_NARROW);
+    });
+
+    if start_clicked {
+      clear_gpu_error();
+      if let Ok(mut g) = self.state.lock() {
+        g.last_error.clear();
+      }
+      let puzzle_label = if is_all_mode(self.selected_puzzle) {
+        "ALL".to_string()
+      } else {
+        format!("#{}", self.selected_puzzle)
+      };
+      crate::app_log!(
+        "[Start] device={} mode={:?} puzzle={} kernel={}-{}",
+        self.device,
+        self.solving_mode,
+        puzzle_label,
+        self.kernel.kernel_type.as_str(),
+        self.kernel.kernel_size
+      );
+      self.started_by_idle = false;
+      self.start_workers();
+    }
+
+    if stop_clicked {
+      crate::app_log!("[Stop] device={} (solver stopped by user)", self.device);
+      self.started_by_idle = false;
+      self.stop_workers();
+    }
+
+    if bench_clicked {
+      self.start_benchmark();
+    }
+
+    if (self.running || self.benchmark_running) && self.graph_enabled {
+      let now = Instant::now();
+
+      let interval_ms: u128 = if self.benchmark_running { 200 } else { 250 };
+      if now.duration_since(self.last_speed_sample).as_millis() >= interval_ms {
+        let speed = if self.benchmark_running {
+          self
+            .state
+            .lock()
+            .map(|s| {
+              if s.benchmark_speed_kps > 0.0 {
+                s.benchmark_speed_kps
+              } else {
+                s.generation_speed
+              }
+            })
+            .unwrap_or(0.0)
+        } else if self.use_live_speed {
+          self
+            .state
+            .lock()
+            .map(|s| {
+              let live: f64 = s.workers.iter().map(|w| w.speed_kps).sum();
+              if live > 0.0 { live } else { s.generation_speed }
+            })
+            .unwrap_or(0.0)
+        } else {
+          self.state.lock().map(|s| s.generation_speed).unwrap_or(0.0)
+        };
+
+        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
+
+        if speed > 0.0 || !self.speed_history.is_empty() {
+          let plot_speed = if speed > 0.0 {
+            speed
+          } else {
+            self.speed_history.back().map(|(s, _)| *s).unwrap_or(0.0)
+          };
+          self.speed_history.push_back((plot_speed, clock));
+
+          if plot_speed > self.max_speed_ever {
+            self.max_speed_ever = plot_speed;
+          }
+        }
+
+        let history_secs = if self.benchmark_running {
+          self.graph_history_secs.max(300)
+        } else {
+          self.graph_history_secs
+        };
+        let sample_secs = interval_ms as f64 / 1000.0;
+        let max_samples = ((history_secs as f64) / sample_secs).ceil() as usize;
+        while self.speed_history.len() > max_samples.max(2) {
+          self.speed_history.pop_front();
+        }
+
+        self.last_speed_sample = now;
+      }
+    }
+
+    {
+      let state = self.state.lock().unwrap();
+
+      if state.found && self.running {
+        self.running = false;
+        self.shutdown.store(true, Ordering::Relaxed);
+      }
+    }
+
+    let state = self.state.lock().unwrap();
+
+    if state.found {
+      egui::Panel::top("found_banner").resizable(false).show(ui, |ui| {
+        ui.add_space(MARGIN_NARROW);
+        ui.colored_label(COL_GPU, "PRIVATE KEY FOUND");
+
+        if !state.found_key.is_empty() {
+          for line in state.found_key.lines() {
+            ui.horizontal(|ui| {
+              if let Some((label, value)) = line.split_once(": ") {
+                ui.label(format!("{}:", label));
+                ui.monospace(value);
+                if ui.small_button("Copy").clicked() {
+                  ui.ctx().copy_text(value.to_string());
+                }
+              } else {
+                ui.monospace(line);
+              }
+            });
+          }
+        }
+      });
+    }
+
+    egui::Panel::bottom("speed_graph_panel")
+      .resizable(self.graph_enabled)
+      .default_size(if self.graph_enabled { self.graph_panel_height } else { 50.0 })
+      .min_size(120.0)
+      .max_size(if self.graph_enabled { f32::INFINITY } else { 40.0 })
+      .show(ui, |ui| {
+        const SAMPLE_SECS: f64 = 0.25;
+        const CONTROLS_H: f32 = 28.0;
+
+        if self.graph_enabled {
+          let avail_h = ui.available_height();
+          if avail_h >= 50.0 {
+            self.graph_panel_height = avail_h;
+          }
+          ui.set_min_height(avail_h);
+
+          let plot_h_avail = (avail_h - CONTROLS_H).max(10.0);
+
+          let history: Vec<(f64, String)> = self.speed_history.iter().cloned().collect();
+          let max_ever = self.max_speed_ever;
+          let total_samples = history.len();
+          let total_secs = total_samples as f64 * SAMPLE_SECS;
+
+          let (response, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), plot_h_avail), egui::Sense::click_and_drag());
+          let rect = response.rect;
+          let plot_left = rect.left() + 52.0;
+          let plot_right = rect.right() - 8.0;
+          let plot_top = rect.top() + 4.0;
+          let plot_bottom = rect.bottom() - 18.0;
+          let plot_w = (plot_right - plot_left).max(1.0);
+          let plot_h = (plot_bottom - plot_top).max(1.0);
+
+          painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 18, 22));
+
+          if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 && total_samples >= 2 {
+              let mouse = response.hover_pos().unwrap_or(rect.center());
+              let focus = ((mouse.x - plot_left) / plot_w).clamp(0.0, 1.0) as f64;
+              let old_span = self.graph_view_span;
+              let zoom = if scroll > 0.0 { 0.85 } else { 1.18 };
+              let new_span = (old_span * zoom).clamp(0.02, 1.0);
+              let old_start = self.graph_view_start;
+              let focus_abs = old_start + focus * old_span;
+              let mut new_start = focus_abs - focus * new_span;
+              if new_start < 0.0 {
+                new_start = 0.0;
+              }
+              if new_start + new_span > 1.0 {
+                new_start = 1.0 - new_span;
+              }
+              self.graph_view_span = new_span;
+              self.graph_view_start = new_start.max(0.0);
+            }
+          }
+
+          if response.drag_started()
+            && let Some(pos) = response.interact_pointer_pos()
+          {
+            self.graph_drag_origin = Some((pos.x, self.graph_view_start));
+          }
+          if response.dragged()
+            && let (Some((ox, ostart)), Some(pos)) = (self.graph_drag_origin, response.interact_pointer_pos())
+          {
+            let dx = (pos.x - ox) as f64 / plot_w as f64;
+            let mut new_start = ostart - dx * self.graph_view_span;
+            new_start = new_start.clamp(0.0, (1.0 - self.graph_view_span).max(0.0));
+            self.graph_view_start = new_start;
+          }
+          if response.drag_stopped() {
+            self.graph_drag_origin = None;
+          }
+
+          if response.double_clicked() {
+            self.graph_view_start = 0.0;
+            self.graph_view_span = 1.0;
+          }
+
+          let has_data = total_samples >= 2;
+          let (vis_lo, vis_hi) = if has_data {
+            let lo = (self.graph_view_start * (total_samples - 1) as f64).floor() as usize;
+            let hi = ((self.graph_view_start + self.graph_view_span) * (total_samples - 1) as f64).ceil() as usize;
+            (lo.min(total_samples - 1), hi.min(total_samples - 1).max(lo + 1))
+          } else {
+            (0, 0)
+          };
+
+          let visible: Vec<(usize, f64, String)> = if has_data {
+            history[vis_lo..=vis_hi]
+              .iter()
+              .enumerate()
+              .map(|(i, (s, clock))| (vis_lo + i, *s, clock.clone()))
+              .collect()
+          } else {
+            Vec::new()
+          };
+
+          let (y_min, y_max) = if !visible.is_empty() {
+            let raw_min = visible.iter().map(|(_, s, _)| *s).fold(f64::INFINITY, f64::min);
+            let raw_max = visible
+              .iter()
+              .map(|(_, s, _)| *s)
+              .fold(0.0_f64, f64::max)
+              .max(if self.graph_view_span >= 0.99 { max_ever } else { 0.0 });
+
+            let mut span = (raw_max - raw_min).max(raw_max * 0.05).max(0.01);
+            if span < raw_max * 0.15 {
+              span = raw_max * 0.15;
+            }
+            let mid = (raw_min + raw_max) * 0.5;
+            let mut y_min = (mid - span * 0.6).max(0.0);
+            let mut y_max = mid + span * 0.6;
+            if y_max <= y_min {
+              y_max = y_min + 0.01;
+            }
+            if raw_max > y_max {
+              y_max = raw_max * 1.05;
+            }
+            if raw_min < y_min {
+              y_min = (raw_min * 0.95).max(0.0);
+            }
+            (y_min, y_max)
+          } else {
+            (0.0, 1.0)
+          };
+
+          let num_lines = 5;
+          for i in 0..num_lines {
+            let t = i as f32 / (num_lines - 1) as f32;
+            let y = plot_bottom - t * plot_h;
+            painter.line_segment(
+              [egui::pos2(plot_left, y), egui::pos2(plot_right, y)],
+              egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 48)),
+            );
+            let label_v = y_min + (y_max - y_min) * t as f64;
+            painter.text(
+              egui::pos2(plot_left - 4.0, y),
+              egui::Align2::RIGHT_CENTER,
+              format_speed(label_v),
+              egui::FontId::monospace(10.0),
+              egui::Color32::from_rgb(120, 120, 130),
+            );
+          }
+
+          if has_data && total_secs > 0.0 {
+            let view_t0 = self.graph_view_start * total_secs;
+            let view_t1 = (self.graph_view_start + self.graph_view_span) * total_secs;
+            let view_dur = (view_t1 - view_t0).max(0.001);
+            let nice_steps = [
+              1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0,
+            ];
+            let target = view_dur / 5.0;
+            let mut step = nice_steps[0];
+            for &s in &nice_steps {
+              step = s;
+              if s >= target {
+                break;
+              }
+            }
+            let first = (view_t0 / step).ceil() * step;
+            let mut t = first;
+            while t <= view_t1 + 0.001 {
+              let frac = ((t - view_t0) / view_dur) as f32;
+              let x = plot_left + frac.clamp(0.0, 1.0) * plot_w;
+              painter.line_segment(
+                [egui::pos2(x, plot_bottom), egui::pos2(x, plot_bottom + 4.0)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 90)),
+              );
+              painter.text(
+                egui::pos2(x, plot_bottom + 6.0),
+                egui::Align2::CENTER_TOP,
+                format_duration(t),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_rgb(120, 120, 130),
+              );
+              t += step;
+            }
+          }
+
+          if has_data && !visible.is_empty() {
+            if max_ever > 0.0 && y_max > y_min && self.graph_view_span >= 0.99 {
+              let t_max = ((max_ever - y_min) / (y_max - y_min)) as f32;
+              let y_max_line = plot_bottom - t_max.clamp(0.0, 1.0) * plot_h;
+              let mut x = plot_left;
+              let dash = 6.0;
+              let gap = 4.0;
+              while x < plot_right {
+                let x2 = (x + dash).min(plot_right);
+                painter.line_segment(
+                  [egui::pos2(x, y_max_line), egui::pos2(x2, y_max_line)],
+                  egui::Stroke::new(1.5, egui::Color32::from_rgb(60, 140, 255)),
+                );
+                x += dash + gap;
+              }
+              painter.text(
+                egui::pos2(plot_right - 2.0, y_max_line - 2.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("max {}", format_speed(max_ever)),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(60, 140, 255),
+              );
+            }
+
+            let target_points = (plot_w as usize).max(2).min(visible.len());
+            let mut points = Vec::with_capacity(target_points);
+            let n = (target_points - 1) as f32;
+            let current_speed = visible.last().map(|(_, s, _)| *s).unwrap_or(0.0);
+
+            for i in 0..target_points {
+              let src_idx = if target_points == visible.len() {
+                i
+              } else {
+                (i as f64 * (visible.len() - 1) as f64 / (target_points - 1) as f64).round() as usize
+              };
+              let (_, v, _) = visible[src_idx.min(visible.len() - 1)];
+              let x = plot_left + (i as f32 / n) * plot_w;
+              let t = ((v - y_min) / (y_max - y_min)) as f32;
+              let y = plot_bottom - t.clamp(0.0, 1.0) * plot_h;
+              points.push(egui::pos2(x, y));
+            }
+
+            painter.add(egui::Shape::line(
+              points.clone(),
+              egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 120)),
+            ));
+
+            if let Some(last) = points.last() {
+              painter.circle_filled(*last, 3.5, egui::Color32::from_rgb(0, 200, 120));
+              painter.text(
+                egui::pos2(last.x - 4.0, last.y + 4.0),
+                egui::Align2::RIGHT_TOP,
+                format!("now {}", format_speed(current_speed)),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(0, 200, 120),
+              );
+            }
+
+            if let Some(pointer) = response.hover_pos()
+              && pointer.x >= plot_left
+              && pointer.x <= plot_right
+              && pointer.y >= plot_top
+              && pointer.y <= plot_bottom
+            {
+              let frac = ((pointer.x - plot_left) / plot_w).clamp(0.0, 1.0);
+              let idx_in_vis = (frac * (visible.len() - 1) as f32).round() as usize;
+              let idx_in_vis = idx_in_vis.min(visible.len() - 1);
+              let (_global_idx, speed, ref clock) = visible[idx_in_vis];
+              let x = plot_left + (idx_in_vis as f32 / (visible.len() - 1).max(1) as f32) * plot_w;
+              let ty = ((speed - y_min) / (y_max - y_min)) as f32;
+              let y = plot_bottom - ty.clamp(0.0, 1.0) * plot_h;
+
+              painter.line_segment(
+                [egui::pos2(x, plot_top), egui::pos2(x, plot_bottom)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(200, 200, 220, 80)),
+              );
+              painter.circle_filled(egui::pos2(x, y), 4.0, egui::Color32::from_rgb(220, 220, 240));
+              painter.circle_filled(egui::pos2(x, y), 2.5, egui::Color32::from_rgb(0, 200, 120));
+
+              let tip = format!("{}  *  {}", format_speed(speed), clock);
+              let tip_pos = egui::pos2(x + 8.0, y - 8.0);
+              let galley = painter.layout_no_wrap(tip, egui::FontId::monospace(11.0), egui::Color32::from_rgb(230, 230, 240));
+              let pad = egui::vec2(6.0, 4.0);
+              let mut box_rect = egui::Rect::from_min_size(tip_pos, galley.size() + pad * 2.0);
+              if box_rect.right() > plot_right {
+                box_rect = box_rect.translate(egui::vec2(plot_right - box_rect.right(), 0.0));
+              }
+              if box_rect.top() < plot_top {
+                box_rect = box_rect.translate(egui::vec2(0.0, plot_top - box_rect.top() + 4.0));
+              }
+              painter.rect_filled(box_rect, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 28, 220));
+              painter.galley(box_rect.min + pad, galley, egui::Color32::from_rgb(230, 230, 240));
+            }
+
+            if self.graph_view_span < 0.999 {
+              let zoom_pct = ((1.0 - self.graph_view_span) / 0.98 * 100.0).clamp(0.0, 100.0);
+              let label = format!("zoom {:.0}%  (double-click reset)", zoom_pct);
+              painter.text(
+                egui::pos2(plot_left + 4.0, plot_top + 2.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_rgb(140, 140, 160),
+              );
+            }
+          } else {
+            let t = ui.input(|i| i.time) as f32;
+            let steps = 64;
+            let mut points = Vec::with_capacity(steps + 1);
+            let y_mid = (plot_top + plot_bottom) * 0.5;
+            let amp = plot_h * 0.03;
+            for i in 0..=steps {
+              let x_t = i as f32 / steps as f32;
+              let x = plot_left + x_t * plot_w;
+              let wave = ((x_t * std::f32::consts::TAU * 1.5) + t * 2.0).sin() * amp;
+              points.push(egui::pos2(x, y_mid + wave));
+            }
+            painter.add(egui::Shape::line(
+              points,
+              egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(0, 200, 120, 90)),
+            ));
+          }
+        }
+
+        ui.horizontal(|ui| {
+          let graph_btn_text = if self.graph_enabled { "Hide Graph" } else { "Show Graph" };
+          if ui.button(graph_btn_text).clicked() {
+            self.graph_enabled = !self.graph_enabled;
+            if !self.graph_enabled {
+              self.speed_history.clear();
+              self.max_speed_ever = 0.0;
+              self.graph_view_start = 0.0;
+              self.graph_view_span = 1.0;
+              self.graph_drag_origin = None;
+            } else {
+              self.last_speed_sample = Instant::now();
+            }
+          }
+
+          ui.separator();
+
+          let speed_btn_text = if self.use_live_speed { "Speed: Live" } else { "Speed: Global" };
+          if ui
+            .button(speed_btn_text)
+            .on_hover_text("Toggle between live worker speed and global average speed")
+            .clicked()
+          {
+            self.use_live_speed = !self.use_live_speed;
+          }
+
+          ui.separator();
+
+          ui.label("History:");
+          let history_options: &[(u32, &str)] = &[(30, "30s"), (60, "1m"), (120, "2m"), (180, "3m"), (300, "5m")];
+
+          for &(secs, label) in history_options {
+            let selected = self.graph_history_secs == secs;
+            if ui.selectable_label(selected, label).clicked() {
+              self.graph_history_secs = secs;
+              const SAMPLE_SECS: f64 = 0.25;
+              let max_samples = ((secs as f64) / SAMPLE_SECS).ceil() as usize;
+              while self.speed_history.len() > max_samples.max(2) {
+                self.speed_history.pop_front();
+              }
+            }
+          }
+        });
+      });
+
+    egui::CentralPanel::default().show(ui, |ui| {
+      let avail_w = ui.available_width();
+      ui.set_min_width(avail_w);
+
+      if self.kernels_loading {
+        ui.add_space(MARGIN_NARROW);
+        ui.horizontal(|ui| {
+          ui.label(egui::RichText::new("Loading kernels").color(COL_ACCENT).strong());
+          if !self.kernels_load_stage.is_empty() {
+            ui.label(egui::RichText::new(format!("  {}", self.kernels_load_stage)).color(COL_GPU));
+          }
+        });
+
+        let bar = egui::ProgressBar::new(self.kernels_load_progress.clamp(0.0, 1.0))
+          .desired_width(avail_w)
+          .show_percentage()
+          .animate(true);
+
+        ui.add(bar);
+      } else if self.selected_puzzle == ALL_PUZZLES {
+        let all_prog = state.all_progress;
+        let cur_puz = state.all_current_puzzle;
+        let sweep = state.all_sweep;
+        let total_p = state.all_total_puzzles;
+        ui.horizontal(|ui| {
+          ui.label(egui::RichText::new("ALL sweep").color(COL_ACCENT).strong());
+          if cur_puz != 0 {
+            ui.label(egui::RichText::new(format!("  now: #{}", cur_puz)).color(COL_GPU));
+          }
+          if total_p > 0 {
+            ui.label(egui::RichText::new(format!("  ({:.0}% of {} puzzles)", all_prog, total_p)).small());
+          }
+          if sweep > 0 {
+            ui.label(egui::RichText::new(format!("  sweep {}", sweep)).small().color(egui::Color32::GRAY));
+          }
+          ui.separator();
+          ui.label(egui::RichText::new("turn").small());
+          let mut secs = self.all_turn_secs;
+          egui::ComboBox::from_id_salt("all_turn_secs")
+            .selected_text(format!("{}s", secs))
+            .width(52.0)
+            .show_ui(ui, |ui| {
+              for &opt in &ALL_MODE_TURN_SECS_OPTIONS {
+                ui.selectable_value(&mut secs, opt, format!("{}s", opt));
+              }
+            });
+          if secs != self.all_turn_secs {
+            self.all_turn_secs = secs;
+            self.all_turn_secs_atomic.store(secs, Ordering::Relaxed);
+            if self.running && is_all_mode(self.selected_puzzle) {
+              arm_all_mode_turn(secs.max(1));
+              crate::app_log!("[ALL] live turn duration → {}s (timer reset for current puzzle)", secs);
+            }
+          }
+          ui.label(egui::RichText::new("per puzzle").small().color(egui::Color32::GRAY))
+            .on_hover_text(
+              "How long each puzzle runs before rotating to the next.\n\
+Can be changed while running - takes effect immediately (timer restarts).\n\
+Workers finish the current chunk after the timer, then GLOBAL_NEXT / ALLOC.log are saved.",
+            );
+        });
+        let bar = egui::ProgressBar::new((all_prog / 100.0).clamp(0.0, 1.0) as f32)
+          .desired_width(avail_w)
+          .show_percentage();
+        ui.add(bar);
+      }
+
+      egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .id_salt("workers_table_scroll")
+        .show(ui, |ui| {
+          ui.set_min_width(avail_w);
+
+          let min_model = 100.0;
+          let min_index = 100.0;
+          let min_key = 100.0;
+
+          let w_device = 70.0;
+          let w_units = 70.0;
+          let w_clock = 90.0;
+          let w_checked = 90.0;
+          let w_speed = 150.0;
+
+          let fixed_sum = w_device + w_units + w_clock + w_checked + w_speed;
+          let remaining = (avail_w - fixed_sum).max(0.0);
+
+          let w_model = (remaining * 0.20).max(min_model);
+          let w_index = (remaining * 0.40).max(min_index);
+          let w_key = (remaining * 0.40).max(min_key);
+
+          let total = w_device + w_model + w_units + w_clock + w_index + w_key + w_checked + w_speed;
+          let scale = if total > avail_w && total > 0.0 { avail_w / total } else { 1.0 };
+
+          TableBuilder::new(ui)
+            .striped(true)
+            .resizable(false)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(w_device * scale).clip(true))
+            .column(Column::exact(w_model * scale).clip(true))
+            .column(Column::exact(w_units * scale).clip(true))
+            .column(Column::exact(w_clock * scale).clip(true))
+            .column(Column::exact(w_index * scale).clip(true))
+            .column(Column::exact(w_key * scale).clip(true))
+            .column(Column::exact(w_checked * scale).clip(true))
+            .column(Column::exact(w_speed * scale).clip(true))
+            .header(26.0, |mut header| {
+              for title in ["Device", "Model", "Units", "Clock", "Index", "Key", "Checked", "Speed"] {
+                header.col(|ui| {
+                  ui.strong(egui::RichText::new(title).color(COL_ACCENT));
+                });
+              }
+            })
+            .body(|mut body| {
+              for row in state.workers.iter() {
+                body.row(20.0, |mut table_row| {
+                  table_row.col(|ui| {
+                    let color = if row.device.starts_with("GPU") { COL_GPU } else { COL_CPU };
+                    ui.colored_label(color, &row.device);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(&row.model);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(&row.units);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(&row.clock);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(&row.index_hex);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(&row.key_hex);
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(format_count(row.checked));
+                  });
+                  table_row.col(|ui| {
+                    ui.monospace(format_speed(row.speed_kps));
+                  });
+                });
+              }
+            });
+        });
+    });
+
+    drop(state);
+
+    self.draw_buy_window(ui.ctx());
+    self.draw_log_window(ui.ctx());
+    self.draw_settings_window(ui.ctx());
+    self.draw_help_window(ui.ctx());
+
+    ui.ctx().request_repaint_after(Duration::from_millis(UI_REFRESH_INTERVAL_MS));
   }
 }
 
@@ -3529,1464 +5028,7 @@ Buying means you accept the product as-is and accept that any failure on your si
 
     self.benchmark_handle = Some(handle);
   }
-}
 
-fn report_err_to_dash(
-  dash: &Arc<Mutex<DashboardState>>,
-  msg: &str,
-) {
-  crate::report_gpu_error(msg);
-  if let Ok(mut g) = dash.lock() {
-    g.last_error = msg.to_string();
-  }
-}
-
-fn parse_best_line(line: &str) -> Option<(u32, u32, u32, u32, String, Option<String>)> {
-  let mut block = None;
-  let mut grid = None;
-  let mut keys = None;
-  let mut mult = None;
-  let mut ksize: Option<String> = None;
-
-  let parts: Vec<&str> = line.split_whitespace().collect();
-
-  let mut kty = String::new();
-  if let Some(best_i) = parts.iter().position(|p| *p == "Best:") {
-    let mut name_parts = Vec::new();
-    for part in parts.iter().skip(best_i + 1) {
-      if part.contains('=') {
-        break;
-      }
-      name_parts.push(*part);
-    }
-    kty = name_parts.join(" ");
-  }
-
-  for part in &parts {
-    if let Some(v) = part.strip_prefix("block=") {
-      block = v.parse().ok();
-    } else if let Some(v) = part.strip_prefix("grid=") {
-      grid = v.parse().ok();
-    } else if let Some(v) = part.strip_prefix("keys=") {
-      keys = v.parse().ok();
-    } else if let Some(v) = part.strip_prefix("chunk=") {
-      let v = v.trim_end_matches('x');
-      mult = v.parse().ok();
-    } else if let Some(v) = part.strip_prefix("size=") {
-      ksize = Some(v.to_string());
-    }
-  }
-  match (block, grid, keys, mult) {
-    (Some(b), Some(g), Some(k), Some(m)) => Some((b, g, k, m, kty, ksize)),
-    _ => None,
-  }
-}
-
-impl eframe::App for KeyHunterApp {
-  fn ui(
-    &mut self,
-    ui: &mut egui::Ui,
-    _frame: &mut eframe::Frame,
-  ) {
-    tray_store_egui_ctx(ui.ctx());
-
-    self.handle_tray_events(ui.ctx());
-    self.poll_idle_solving();
-    self.sync_tray_icon();
-
-    let minimized = ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false));
-    if minimized && self.window_visible {
-      self.window_visible = false;
-    }
-
-    if self.tray_enabled && !self.window_visible {
-      ui.ctx().request_repaint_after(Duration::from_millis(500));
-    }
-
-    if ui.ctx().input(|i| i.viewport().close_requested()) {
-      if self.force_quit {
-        self.stop_workers();
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.tray_icon = None;
-      } else if self.hide_on_close {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        self.hide_to_tray(ui.ctx());
-        crate::app_log!("[TRAY] Window hidden (Hide on close is ON)");
-      } else {
-        self.force_quit = true;
-        self.stop_workers();
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.tray_icon = None;
-      }
-    }
-
-    if let Some(path) = self.pending_kernel_autoload.take()
-      && matches!(self.device.as_str(), "GPU" | "Both")
-      && !self.kernels_loading
-    {
-      crate::app_log!("[SETTINGS] Auto-loading kernel package: {path}");
-      self.begin_kernel_load(std::path::PathBuf::from(path), ui.ctx().clone());
-    }
-
-    self.poll_kernel_load();
-    if self.kernels_loading {
-      ui.ctx().request_repaint_after(Duration::from_millis(50));
-    }
-
-    self.ingest_pending_logs();
-
-    if ui.ctx().input(|i| i.key_pressed(egui::Key::F12)) {
-      self.show_log_window = !self.show_log_window;
-    }
-
-    if ui.ctx().input(|i| i.key_pressed(egui::Key::F10)) {
-      self.show_settings_window = !self.show_settings_window;
-    }
-
-    if ui.ctx().input(|i| i.key_pressed(egui::Key::F2)) {
-      if self.show_buy_window {
-        self.show_buy_window = false;
-      } else {
-        self.open_buy_window();
-      }
-    }
-
-    if ui.ctx().input(|i| i.key_pressed(egui::Key::F1)) {
-      self.show_help_window = !self.show_help_window;
-    }
-
-    let mut start_clicked = false;
-    let mut stop_clicked = false;
-    let mut bench_clicked = false;
-
-    if let Some(err) = take_gpu_error(true) {
-      if let Ok(mut g) = self.state.lock() {
-        g.last_error = err;
-      }
-      if self.running {
-        self.stop_workers();
-      }
-    }
-
-    if self.running && !self.worker_handles.is_empty() && self.worker_handles.iter().all(|h| h.is_finished()) {
-      self.running = false;
-      for h in self.worker_handles.drain(..) {
-        let _ = h.join();
-      }
-    }
-
-    if self.benchmark_running {
-      if let Some(handle) = self.benchmark_handle.take() {
-        if handle.is_finished() {
-          let _ = handle.join();
-          self.benchmark_running = false;
-
-          let applied = self.state.lock().ok().and_then(|g| {
-            match (
-              g.benchmark_best_kernel.clone(),
-              g.benchmark_best_size.clone(),
-              g.benchmark_best_block,
-              g.benchmark_best_grid,
-              g.benchmark_best_keys,
-              g.benchmark_best_chunk,
-            ) {
-              (Some(k), Some(sz), Some(b), Some(gr), Some(keys), Some(ch)) => Some((k, sz, b, gr, keys, ch)),
-              _ => None,
-            }
-          });
-
-          if let Some((k_name, k_size, block, grid, keys, chunk)) = applied {
-            self.block_size = block;
-            self.grid_size = grid;
-            self.parallel_keys = keys;
-            self.chunk_multiplier = chunk;
-
-            if self.gpu_count <= 1 {
-              self.launch_manual = true;
-            }
-
-            if let Some(ty) = KernelType::from_string(&k_name).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == k_name)) {
-              self.kernel.kernel_type = ty;
-              self.kernel.kernel_size = k_size;
-              self.refresh_kernel();
-            }
-          } else {
-            let best_line = if let Ok(g) = self.state.lock() {
-              let s = g.benchmark_best.clone();
-              if s.is_empty() { None } else { Some(s) }
-            } else {
-              None
-            };
-
-            if let Some(best_line) = best_line
-              && let Some((block, grid, keys, mult, kty_name, ksize)) = parse_best_line(&best_line)
-            {
-              self.block_size = block;
-              self.grid_size = grid;
-              self.parallel_keys = keys;
-              self.chunk_multiplier = mult;
-
-              if self.gpu_count <= 1 {
-                self.launch_manual = true;
-              }
-
-              if let Some(ksize) = ksize
-                && let Some(ty) =
-                  KernelType::from_string(&kty_name).or_else(|| KernelType::ALL.iter().copied().find(|t| t.display_name() == kty_name))
-              {
-                self.kernel.kernel_type = ty;
-                self.kernel.kernel_size = ksize;
-                self.refresh_kernel();
-              }
-            }
-          }
-        } else {
-          self.benchmark_handle = Some(handle);
-        }
-      } else {
-        self.benchmark_running = false;
-      }
-    }
-
-    egui::Panel::top("header_panel").resizable(false).show(ui, |ui| {
-      let group_frame = |color: egui::Color32| {
-        egui::Frame::NONE
-          .stroke(egui::Stroke::new(1.5, color))
-          .corner_radius(6.0)
-          .inner_margin(egui::Margin::symmetric(MARGIN_WIDE as i8, MARGIN_NARROW as i8))
-          .outer_margin(egui::Margin::ZERO)
-          .fill(egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18))
-      };
-
-      let fixed_frame = |ui: &mut egui::Ui, color: egui::Color32, add: &mut dyn FnMut(&mut egui::Ui)| {
-        ui.allocate_ui_with_layout(egui::vec2(FRAME_W, FRAME_H), egui::Layout::top_down(egui::Align::Min), |ui| {
-          group_frame(color).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = MARGIN_NARROW;
-            add(ui);
-          });
-        });
-      };
-
-      let show_gpu = matches!(self.device.as_str(), "GPU" | "Both") && self.kernels_loaded;
-      let show_bench = show_gpu && self.show_benchmark_frame;
-
-      let n_frames = if !show_gpu {
-        2
-      } else if show_bench {
-        4
-      } else {
-        3
-      };
-      let frames_total_w = n_frames as f32 * FRAME_W + (n_frames - 1) as f32 * MARGIN_WIDE;
-
-      ui.vertical_centered(|ui| {
-        #[cfg(feature = "test_vectors")]
-        let title = "Bitcoin Puzzle Test";
-
-        #[cfg(not(feature = "test_vectors"))]
-        let title = "Bitcoin Puzzle";
-
-        ui.heading(egui::RichText::new(title).color(COL_ACCENT).size(28.0).strong());
-        ui.add_space(MARGIN_NARROW);
-      });
-
-      ui.vertical_centered(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(frames_total_w, 25.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-          let puzzle_enabled = !self.running && !self.benchmark_running;
-
-          ui.add_enabled_ui(puzzle_enabled, |ui| {
-            let mut selected = self.selected_puzzle;
-            let selected_label = if selected == ALL_PUZZLES {
-              "ALL".to_string()
-            } else {
-              match puzzle_by_number(selected) {
-                Some(info) if info.has_pubkey() => format!("#{}*", selected),
-                _ => format!("#{}", selected),
-              }
-            };
-
-            egui::ComboBox::from_id_salt("puzzle_select")
-              .selected_text(selected_label)
-              .show_ui(ui, |ui| {
-                ui.selectable_value(&mut selected, ALL_PUZZLES, "ALL");
-                for p in active_puzzles() {
-                  let label = if p.has_pubkey() {
-                    format!("#{}*", p.number)
-                  } else {
-                    format!("#{}", p.number)
-                  };
-                  ui.selectable_value(&mut selected, p.number, label);
-                }
-              });
-
-            if selected != self.selected_puzzle {
-              self.selected_puzzle = selected;
-              if selected == ALL_PUZZLES {
-                if let Ok(mut gui) = self.state.lock() {
-                  gui.target = "ALL unsolved puzzles (#71-#160)".to_string();
-                  gui.range = "round-robin batches across remaining puzzles".to_string();
-                  gui.all_progress = 0.0;
-                  gui.all_current_puzzle = 0;
-                  gui.all_total_puzzles = remaining_puzzles().len();
-                }
-              } else if let Some(info) = puzzle_by_number(selected)
-                && let Ok(mut gui) = self.state.lock()
-              {
-                gui.target = if info.has_pubkey() {
-                  format!("{}  [pubkey]", info.address)
-                } else {
-                  info.address.to_string()
-                };
-                gui.range = format!("{} - {}", info.range_start().to_hex(), info.range_end().to_hex());
-                gui.all_progress = 0.0;
-                gui.all_current_puzzle = 0;
-                gui.all_total_puzzles = 0;
-              }
-            }
-          });
-        });
-        ui.add_space(MARGIN_NARROW);
-      });
-
-      ui.vertical_centered(|ui| {
-        ui.allocate_ui_with_layout(
-          egui::vec2(frames_total_w, FRAME_H),
-          egui::Layout::left_to_right(egui::Align::Center),
-          |ui| {
-            ui.horizontal_top(|ui| {
-              fixed_frame(ui, COL_ACCENT, &mut |ui| {
-                ui.set_height(FRAME_H);
-                ui.label(egui::RichText::new("Solver").color(COL_ACCENT).strong());
-                ui.add_space(MARGIN_NARROW);
-
-                ui.horizontal(|ui| {
-                  let can_start = !self.running && !self.benchmark_running && (self.device == "CPU" || self.kernels_loaded);
-                  ui.add_enabled_ui(can_start, |ui| {
-                    let t = egui::RichText::new("  Start  ").color(COL_ACCENT).strong();
-                    if ui.button(t).clicked() {
-                      start_clicked = true;
-                    }
-                  });
-
-                  ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(self.running || self.benchmark_running, |ui| {
-                      let c = if self.benchmark_running { COL_BENCH } else { COL_ACCENT };
-                      let t = egui::RichText::new("  Stop  ").color(c).strong();
-                      if ui
-                        .button(t)
-                        .on_hover_text(if self.benchmark_running {
-                          "Cancel the running GPU benchmark (stops after current trial)"
-                        } else {
-                          "Stop the key search"
-                        })
-                        .clicked()
-                      {
-                        stop_clicked = true;
-                      }
-                    });
-                  });
-                });
-
-                ui.add_space(MARGIN_NARROW);
-
-                ui.label(egui::RichText::new("Device").color(COL_ACCENT));
-                ui.add_enabled_ui(!self.running, |ui| {
-                  let prev = self.device.clone();
-                  let device_color = match self.device.as_str() {
-                    "CPU" => COL_CPU,
-                    "GPU" => COL_GPU,
-                    _ => COL_ACCENT,
-                  };
-                  egui::ComboBox::from_id_salt("device_combo")
-                    .width(ui.available_width())
-                    .selected_text(egui::RichText::new(&self.device).color(device_color))
-                    .show_ui(ui, |ui| {
-                      ui.selectable_value(&mut self.device, "CPU".to_string(), egui::RichText::new("CPU").color(COL_CPU));
-                      if self.has_gpu {
-                        ui.selectable_value(&mut self.device, "GPU".to_string(), egui::RichText::new("GPU").color(COL_GPU));
-                        ui.selectable_value(&mut self.device, "Both".to_string(), egui::RichText::new("Both").color(COL_ACCENT));
-                      }
-                    });
-                  if self.device != prev && !self.running {
-                    let ks: u32 = self.kernel.kernel_size.parse().unwrap_or(self.parallel_keys);
-                    let inventory = if self.device == "CPU" || !self.has_gpu {
-                      GpuInventory { devices: vec![] }
-                    } else {
-                      match detect_gpus(self.kernel.kernel_type, &self.kernel.kernel_size, ks) {
-                        Ok(inv) => inv,
-                        Err(e) => {
-                          crate::app_log!("[WARN] GPU detection on device change failed: {}", e);
-                          GpuInventory { devices: vec![] }
-                        }
-                      }
-                    };
-                    if let Ok(mut gui) = self.state.lock() {
-                      Self::fill_workers_table(&mut gui.workers, &self.device, &inventory);
-                    }
-                  }
-                });
-
-                ui.label(egui::RichText::new("Mode").color(COL_ACCENT));
-                let mode_text = match self.solving_mode {
-                  SearchMode::Sequence => "Sequence",
-                  SearchMode::Pcg => "PCG",
-                };
-
-                ui.add_enabled_ui(!self.running, |ui| {
-                  let prev_mode = self.solving_mode;
-                  egui::ComboBox::from_id_salt("mode_combo")
-                    .width(ui.available_width())
-                    .selected_text(egui::RichText::new(mode_text).color(COL_ACCENT))
-                    .show_ui(ui, |ui| {
-                      ui.selectable_value(&mut self.solving_mode, SearchMode::Sequence, "Sequence");
-                      ui.selectable_value(&mut self.solving_mode, SearchMode::Pcg, "PCG");
-                    });
-
-                  if self.solving_mode != prev_mode {
-                    let reset = AllCycleState { index: 0, sweep: 0 };
-                    save_all_cycle_state(&reset);
-                    if let Ok(mut gui) = self.state.lock() {
-                      gui.all_progress = 0.0;
-                      gui.all_current_puzzle = 0;
-                      gui.all_sweep = 0;
-                      gui.all_total_puzzles = remaining_puzzles().len();
-                      gui.status_message = format!("Mode → {:?} - ALL cycle reset to first puzzle", self.solving_mode);
-                    }
-                    crate::app_log!("[ALL] Mode switched {:?} → {:?} - cycle reset to index 0", prev_mode, self.solving_mode);
-                  }
-                });
-
-                ui.label(egui::RichText::new("Intensity").color(COL_ACCENT));
-                let mut pct = (self.intensity * 100.0).round() as u32;
-                if ui.add(egui::Slider::new(&mut pct, 10..=100).step_by(10.0).suffix("%")).changed() {
-                  self.intensity = pct as f32 / 100.0;
-                  self.intensity_atomic.store(pct, Ordering::Relaxed);
-                }
-
-                let mut turbo = self.intel_turbo;
-                if ui
-                  .checkbox(&mut turbo, egui::RichText::new("Intel Turbo").color(COL_CPU))
-                  .on_hover_text(
-                    "Enable/disable Intel Turbo Boost via\n\
-                   /sys/devices/system/cpu/intel_pstate/no_turbo",
-                  )
-                  .changed()
-                {
-                  self.intel_turbo = turbo;
-                  Self::set_intel_turbo(turbo);
-                }
-
-                let wants_gpu = matches!(self.device.as_str(), "GPU" | "Both");
-                if wants_gpu {
-                  ui.horizontal(|ui| {
-                    ui.add_space(MARGIN_NARROW);
-
-                    ui.add_enabled_ui(!self.running && !self.kernels_loading, |ui| {
-                      let label = if self.kernels_loaded { "Reload kernels" } else { "Load kernels" };
-                      if ui
-                        .button(egui::RichText::new(label).color(COL_GPU).strong())
-                        .on_hover_text("Select a machine-locked kernels.OWL package")
-                        .clicked()
-                      {
-                        self.open_kernels_dialog(ui.ctx().clone());
-                      }
-                    });
-
-                    if !self.kernels_loaded {
-                      ui.add_space(MARGIN_NARROW);
-                      if ui
-                        .button(egui::RichText::new("Buy Kernel Pack").color(COL_ACCENT).strong())
-                        .on_hover_text(
-                          "Open the Buy window.\n\
-                       Generate a short encrypted payload that you send to the seller\n\
-                       so a machine-locked kernels.OWL can be built for this PC only.",
-                        )
-                        .clicked()
-                      {
-                        self.open_buy_window();
-                      }
-                    }
-                  });
-                }
-              });
-
-              if show_gpu {
-                fixed_frame(ui, COL_GPU, &mut |ui| {
-                  ui.set_height(FRAME_H);
-                  ui.label(egui::RichText::new("GPU").color(COL_GPU).strong());
-                  ui.add_space(MARGIN_NARROW);
-
-                  ui.horizontal(|ui| {
-                    if !self.kernels_status.is_empty() && !self.kernels_loading {
-                      let color = if self.kernels_loaded { COL_GPU } else { COL_ERROR };
-                      let fmt = "cubin";
-
-                      ui.label(egui::RichText::new(format!("{} {}", self.kernels_status, fmt)).color(color))
-                        .on_hover_text("Format is determined by the loaded kernels.OWL package.\nUser cannot change it.");
-                    } else if self.kernels_loading {
-                      ui.label(
-                        egui::RichText::new("Loading package… (see progress bar above devices)")
-                          .color(COL_ACCENT)
-                          .small(),
-                      );
-                    }
-                  });
-
-                  ui.add_enabled_ui(!self.running, |ui| {
-                    egui::ComboBox::from_id_salt("kernel_type_combo")
-                      .width(ui.available_width())
-                      .selected_text(egui::RichText::new(self.kernel.kernel_type.display_name()).color(COL_GPU))
-                      .show_ui(ui, |ui| {
-                        for &ty in &[KernelType::ChudnovskyAddG, KernelType::ChudnovskyMeloniCoZ] {
-                          if !self.registry.sizes_for(ty).is_empty()
-                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
-                          {
-                            self.on_kernel_type_changed();
-                          }
-                        }
-
-                        ui.separator();
-
-                        for &ty in &[
-                          KernelType::Jacobian,
-                          KernelType::JacobianCoZMeloni,
-                          KernelType::JacobianLinearGlv,
-                          KernelType::JacobianEndoGlv,
-                          KernelType::JacobianKaratsuba,
-                        ] {
-                          if !self.registry.sizes_for(ty).is_empty()
-                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
-                          {
-                            self.on_kernel_type_changed();
-                          }
-                        }
-
-                        ui.separator();
-
-                        for &ty in &[
-                          KernelType::ProjectiveAddGLazy,
-                          KernelType::ProjectiveBaby,
-                          KernelType::ProjectiveLatticeGlv,
-                          KernelType::ProjectiveRestrictedGlv,
-                          KernelType::ProjectiveXOnlyRegG,
-                          KernelType::ProjectiveXZBatch,
-                          KernelType::ProjectiveZFactorBatch,
-                        ] {
-                          if !self.registry.sizes_for(ty).is_empty()
-                            && ui.selectable_value(&mut self.kernel.kernel_type, ty, ty.display_name()).changed()
-                          {
-                            self.on_kernel_type_changed();
-                          }
-                        }
-
-                        ui.separator();
-
-                        if !self.registry.sizes_for(KernelType::Xyzz).is_empty()
-                          && ui
-                            .selectable_value(&mut self.kernel.kernel_type, KernelType::Xyzz, KernelType::Xyzz.display_name())
-                            .changed()
-                        {
-                          self.on_kernel_type_changed();
-                        }
-
-                        ui.separator();
-
-                        if !self.registry.sizes_for(KernelType::XzDifferential).is_empty()
-                          && ui
-                            .selectable_value(
-                              &mut self.kernel.kernel_type,
-                              KernelType::XzDifferential,
-                              KernelType::XzDifferential.display_name(),
-                            )
-                            .changed()
-                        {
-                          self.on_kernel_type_changed();
-                        }
-                      });
-                  });
-
-                  ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                      ui.label(egui::RichText::new("Size").color(COL_GPU));
-                      ui.add_enabled_ui(!self.running, |ui| {
-                        let sizes: Vec<String> = self.registry.sizes_for(self.kernel.kernel_type).to_vec();
-                        egui::ComboBox::from_id_salt("kernel_size_combo")
-                          .width(110.0)
-                          .selected_text(egui::RichText::new(&self.kernel.kernel_size).color(COL_GPU))
-                          .show_ui(ui, |ui| {
-                            for s in sizes {
-                              if ui.selectable_value(&mut self.kernel.kernel_size, s.clone(), s.as_str()).changed() {
-                                self.parallel_keys = s.parse().unwrap_or(1024);
-                                self.refresh_kernel();
-                              }
-                            }
-                          });
-                      });
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                      ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Keys").color(COL_GPU));
-                        ui.add_enabled_ui(!self.running, |ui| {
-                          ui.horizontal(|ui| {
-                            let ks: u32 = self.kernel.kernel_size.parse().unwrap_or(1024);
-                            let min_pk = (ks / 8).max(8);
-                            let max_pk = (ks * 8).max(4096);
-                            let step = if ui.input(|i| i.modifiers.shift) { 64 } else { 8 };
-                            if ui
-                              .add_enabled(self.parallel_keys > min_pk, egui::Button::new(egui::RichText::new("-").color(COL_GPU)))
-                              .on_hover_text("Click: −8\nShift+click: −64")
-                              .clicked()
-                            {
-                              self.parallel_keys = self.parallel_keys.saturating_sub(step).max(min_pk);
-                              self.parallel_keys = (self.parallel_keys / 8) * 8;
-                              if self.parallel_keys < min_pk {
-                                self.parallel_keys = min_pk;
-                              }
-                            }
-                            let display = self.parallel_keys.clamp(min_pk, max_pk);
-                            ui.monospace(egui::RichText::new(format!("{display:4}")).color(COL_GPU));
-                            if ui
-                              .add_enabled(self.parallel_keys < max_pk, egui::Button::new(egui::RichText::new("+").color(COL_GPU)))
-                              .on_hover_text("Click: +8\nShift+click: +64")
-                              .clicked()
-                            {
-                              self.parallel_keys = (self.parallel_keys + step).min(max_pk);
-                              self.parallel_keys = (self.parallel_keys / 8) * 8;
-                              if self.parallel_keys > max_pk {
-                                self.parallel_keys = max_pk;
-                              }
-                            }
-                          });
-                        });
-                      });
-                    });
-                  });
-
-                  ui.label(egui::RichText::new("Launch mode").color(COL_GPU));
-                  let multi_gpu = self.gpu_count > 1;
-                  if multi_gpu {
-                    self.launch_manual = false;
-                  }
-                  ui.add_enabled_ui(!self.running && !multi_gpu, |ui| {
-                    let launch_label = if self.launch_manual { "Manual" } else { "Auto" };
-                    let response = egui::ComboBox::from_id_salt("launch_mode_combo")
-                      .width(ui.available_width())
-                      .selected_text(egui::RichText::new(launch_label).color(COL_GPU))
-                      .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.launch_manual, false, "Auto");
-                        ui.selectable_value(&mut self.launch_manual, true, "Manual");
-                      })
-                      .response;
-                    if multi_gpu {
-                      response.on_disabled_hover_text(
-                        "Multi-GPU detected: Manual launch is disabled in v1.\n\
-                         Each GPU uses Auto parameters derived from its SM count.\n\
-                         Per-GPU Manual tuning will be supported in v2.",
-                      );
-                    }
-                  });
-                  if multi_gpu {
-                    ui.label(
-                      egui::RichText::new("Multi-GPU: Auto only (per-GPU Manual in v2)")
-                        .small()
-                        .italics()
-                        .color(egui::Color32::from_gray(160)),
-                    );
-                  }
-
-                  ui.horizontal(|ui| {
-                    let three_size = (ui.available_width() / 3.0) - MARGIN_NARROW;
-
-                    ui.vertical(|ui| {
-                      ui.label(egui::RichText::new("Block").color(COL_GPU));
-                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
-                        egui::ComboBox::from_id_salt("block_size_combo")
-                          .width(three_size)
-                          .selected_text(egui::RichText::new(format!("{}", self.block_size)).color(COL_GPU))
-                          .show_ui(ui, |ui| {
-                            for &b in BLOCK_SIZES {
-                              ui.selectable_value(&mut self.block_size, b, format!("{b}"));
-                            }
-                          });
-                      });
-                    });
-
-                    ui.vertical(|ui| {
-                      ui.label(egui::RichText::new("Grid").color(COL_GPU));
-                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
-                        egui::ComboBox::from_id_salt("grid_size_combo")
-                          .width(three_size)
-                          .selected_text(egui::RichText::new(format!("{}", self.grid_size)).color(COL_GPU))
-                          .show_ui(ui, |ui| {
-                            for &g in GRID_SIZES {
-                              ui.selectable_value(&mut self.grid_size, g, format!("{g}"));
-                            }
-                          });
-                      });
-                    });
-
-                    ui.vertical(|ui| {
-                      ui.label(egui::RichText::new("Chunk").color(COL_GPU));
-                      ui.add_enabled_ui(!self.running && self.launch_manual, |ui| {
-                        egui::ComboBox::from_id_salt("chunk_mult_combo")
-                          .width(three_size)
-                          .selected_text(egui::RichText::new(format!("{}x", self.chunk_multiplier)).color(COL_GPU))
-                          .show_ui(ui, |ui| {
-                            for &m in CHUNK_MULTIPLIERS {
-                              ui.selectable_value(&mut self.chunk_multiplier, m, format!("{m}x"));
-                            }
-                          })
-                          .response
-                          .on_hover_text("Full GPU launches per allocator chunk (1x = blockxgridxkeys).");
-                      });
-                    });
-                  });
-
-                  ui.checkbox(&mut self.show_benchmark_frame, egui::RichText::new("Benchmark GPU").color(COL_GPU))
-                    .on_hover_text("Show the Benchmark frame next to GPU");
-                });
-              }
-
-              if show_bench {
-                fixed_frame(ui, COL_BENCH, &mut |ui| {
-                  ui.set_height(FRAME_H);
-                  ui.label(egui::RichText::new("Benchmark").color(COL_BENCH).strong());
-                  ui.add_space(MARGIN_WIDE);
-
-                  ui.add_enabled_ui(!self.running && !self.benchmark_running && self.has_gpu && self.kernels_loaded, |ui| {
-                    let t = egui::RichText::new("  Run Benchmark  ").color(COL_BENCH).strong();
-                    if ui
-                      .button(t)
-                      .on_hover_text(
-                        "Hill-climb per kernelxsize from the loaded kernels.OWL package.\n\
-                         Best params applied when done.\n\
-                         Stop cancels between trials.\n\
-                         Requires a loaded package (Load kernels).",
-                      )
-                      .clicked()
-                    {
-                      bench_clicked = true;
-                    }
-                  });
-
-                  if !self.kernels_loaded {
-                    ui.label(egui::RichText::new("Load kernels.OWL first").color(COL_ERROR).small());
-                  }
-
-                  ui.add_space(MARGIN_WIDE);
-
-                  ui.add_enabled_ui(!self.running && !self.benchmark_running, |ui| {
-                    ui.label(egui::RichText::new("Seconds / trial").color(COL_BENCH));
-                    egui::ComboBox::from_id_salt("bench_secs_combo")
-                      .width(ui.available_width())
-                      .selected_text(egui::RichText::new(format!("{}s", self.bench_seconds)).color(COL_BENCH))
-                      .show_ui(ui, |ui| {
-                        for &s in &[1u32, 2, 3, 5, 10] {
-                          ui.selectable_value(&mut self.bench_seconds, s, format!("{s}s"));
-                        }
-                      });
-
-                    ui.add_space(MARGIN_NARROW);
-                    ui.checkbox(&mut self.bench_all_kernels, egui::RichText::new("All kernels").color(COL_BENCH))
-                      .on_hover_text("Bench every kernel type x size present in the loaded package.");
-                  });
-                });
-              }
-
-              fixed_frame(ui, COL_CPU, &mut |ui| {
-                ui.vertical_centered(|ui| {
-                  ui.set_height(FRAME_H);
-                  let state = self.state.lock().unwrap();
-
-                  if state.found {
-                    ui.colored_label(COL_GPU, "FOUND");
-                  } else if self.benchmark_running {
-                    ui.colored_label(COL_BENCH, "BENCHMARKING");
-                  } else if self.running {
-                    ui.colored_label(COL_GPU, "RUNNING");
-                  } else {
-                    ui.colored_label(COL_ERROR, "STOPPED");
-                  }
-
-                  ui.separator();
-
-                  ui.label(egui::RichText::new(format!("Speed  {}", format_speed(state.generation_speed))).color(COL_ACCENT));
-                  ui.separator();
-                  ui.label(egui::RichText::new(format!("Checked  {}", format_count(state.total_checked))).color(COL_ACCENT));
-                  ui.separator();
-                  ui.label(egui::RichText::new(format!("Progress  {:.6}%", state.progress)).color(COL_ACCENT));
-                  ui.separator();
-                  ui.label(egui::RichText::new(format!("Time  {}", state.elapsed)).color(COL_ACCENT));
-                  ui.separator();
-
-                  if self.kernels_loaded {
-                    if let Some(ref email) = self.loaded_email {
-                      ui.label(egui::RichText::new(format!("LICENSED TO: \n{}", email)).color(COL_ACCENT));
-                    }
-
-                    if let Some(ref lid) = self.loaded_machine_fp {
-                      ui.label(egui::RichText::new(lid).color(COL_ACCENT).small())
-                        .on_hover_text("Machine fingerprint");
-                    }
-                  }
-                });
-              });
-            });
-          },
-        );
-      });
-
-      ui.add_space(MARGIN_NARROW);
-
-      ui.vertical_centered(|ui| {
-        let st = self.state.lock().unwrap();
-
-        if !st.last_error.is_empty() {
-          ui.colored_label(COL_ERROR, format!("GPU ERROR: {}", st.last_error));
-        }
-        if !st.benchmark_status.is_empty() {
-          ui.colored_label(COL_BENCH, format!("Bench: {}", st.benchmark_status));
-        }
-        if !st.benchmark_best.is_empty() {
-          ui.colored_label(COL_BENCH, &st.benchmark_best);
-        }
-      });
-
-      ui.add_space(MARGIN_NARROW);
-    });
-
-    if start_clicked {
-      clear_gpu_error();
-      if let Ok(mut g) = self.state.lock() {
-        g.last_error.clear();
-      }
-      let puzzle_label = if is_all_mode(self.selected_puzzle) {
-        "ALL".to_string()
-      } else {
-        format!("#{}", self.selected_puzzle)
-      };
-      crate::app_log!(
-        "[Start] device={} mode={:?} puzzle={} kernel={}-{}",
-        self.device,
-        self.solving_mode,
-        puzzle_label,
-        self.kernel.kernel_type.as_str(),
-        self.kernel.kernel_size
-      );
-      self.started_by_idle = false;
-      self.start_workers();
-    }
-
-    if stop_clicked {
-      crate::app_log!("[Stop] device={} (solver stopped by user)", self.device);
-      self.started_by_idle = false;
-      self.stop_workers();
-    }
-
-    if bench_clicked {
-      self.start_benchmark();
-    }
-
-    if (self.running || self.benchmark_running) && self.graph_enabled {
-      let now = Instant::now();
-
-      let interval_ms: u128 = if self.benchmark_running { 200 } else { 250 };
-      if now.duration_since(self.last_speed_sample).as_millis() >= interval_ms {
-        let speed = if self.benchmark_running {
-          self
-            .state
-            .lock()
-            .map(|s| {
-              if s.benchmark_speed_kps > 0.0 {
-                s.benchmark_speed_kps
-              } else {
-                s.generation_speed
-              }
-            })
-            .unwrap_or(0.0)
-        } else if self.use_live_speed {
-          self
-            .state
-            .lock()
-            .map(|s| {
-              let live: f64 = s.workers.iter().map(|w| w.speed_kps).sum();
-              if live > 0.0 { live } else { s.generation_speed }
-            })
-            .unwrap_or(0.0)
-        } else {
-          self.state.lock().map(|s| s.generation_speed).unwrap_or(0.0)
-        };
-
-        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-
-        if speed > 0.0 || !self.speed_history.is_empty() {
-          let plot_speed = if speed > 0.0 {
-            speed
-          } else {
-            self.speed_history.back().map(|(s, _)| *s).unwrap_or(0.0)
-          };
-          self.speed_history.push_back((plot_speed, clock));
-
-          if plot_speed > self.max_speed_ever {
-            self.max_speed_ever = plot_speed;
-          }
-        }
-
-        let history_secs = if self.benchmark_running {
-          self.graph_history_secs.max(300)
-        } else {
-          self.graph_history_secs
-        };
-        let sample_secs = interval_ms as f64 / 1000.0;
-        let max_samples = ((history_secs as f64) / sample_secs).ceil() as usize;
-        while self.speed_history.len() > max_samples.max(2) {
-          self.speed_history.pop_front();
-        }
-
-        self.last_speed_sample = now;
-      }
-    }
-
-    {
-      let state = self.state.lock().unwrap();
-
-      if state.found && self.running {
-        self.running = false;
-        self.shutdown.store(true, Ordering::Relaxed);
-      }
-    }
-
-    let state = self.state.lock().unwrap();
-
-    if state.found {
-      egui::Panel::top("found_banner").resizable(false).show(ui, |ui| {
-        ui.add_space(MARGIN_NARROW);
-        ui.colored_label(COL_GPU, "PRIVATE KEY FOUND");
-
-        if !state.found_key.is_empty() {
-          for line in state.found_key.lines() {
-            ui.horizontal(|ui| {
-              if let Some((label, value)) = line.split_once(": ") {
-                ui.label(format!("{}:", label));
-                ui.monospace(value);
-                if ui.small_button("Copy").clicked() {
-                  ui.ctx().copy_text(value.to_string());
-                }
-              } else {
-                ui.monospace(line);
-              }
-            });
-          }
-        }
-      });
-    }
-
-    egui::Panel::bottom("speed_graph_panel")
-      .resizable(self.graph_enabled)
-      .default_size(if self.graph_enabled { self.graph_panel_height } else { 50.0 })
-      .min_size(120.0)
-      .max_size(if self.graph_enabled { f32::INFINITY } else { 40.0 })
-      .show(ui, |ui| {
-        const SAMPLE_SECS: f64 = 0.25;
-        const CONTROLS_H: f32 = 28.0;
-
-        if self.graph_enabled {
-          let avail_h = ui.available_height();
-          if avail_h >= 50.0 {
-            self.graph_panel_height = avail_h;
-          }
-          ui.set_min_height(avail_h);
-
-          let plot_h_avail = (avail_h - CONTROLS_H).max(10.0);
-
-          let history: Vec<(f64, String)> = self.speed_history.iter().cloned().collect();
-          let max_ever = self.max_speed_ever;
-          let total_samples = history.len();
-          let total_secs = total_samples as f64 * SAMPLE_SECS;
-
-          let (response, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), plot_h_avail), egui::Sense::click_and_drag());
-          let rect = response.rect;
-          let plot_left = rect.left() + 52.0;
-          let plot_right = rect.right() - 8.0;
-          let plot_top = rect.top() + 4.0;
-          let plot_bottom = rect.bottom() - 18.0;
-          let plot_w = (plot_right - plot_left).max(1.0);
-          let plot_h = (plot_bottom - plot_top).max(1.0);
-
-          painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(18, 18, 22));
-
-          if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 && total_samples >= 2 {
-              let mouse = response.hover_pos().unwrap_or(rect.center());
-              let focus = ((mouse.x - plot_left) / plot_w).clamp(0.0, 1.0) as f64;
-              let old_span = self.graph_view_span;
-              let zoom = if scroll > 0.0 { 0.85 } else { 1.18 };
-              let new_span = (old_span * zoom).clamp(0.02, 1.0);
-              let old_start = self.graph_view_start;
-              let focus_abs = old_start + focus * old_span;
-              let mut new_start = focus_abs - focus * new_span;
-              if new_start < 0.0 {
-                new_start = 0.0;
-              }
-              if new_start + new_span > 1.0 {
-                new_start = 1.0 - new_span;
-              }
-              self.graph_view_span = new_span;
-              self.graph_view_start = new_start.max(0.0);
-            }
-          }
-
-          if response.drag_started()
-            && let Some(pos) = response.interact_pointer_pos()
-          {
-            self.graph_drag_origin = Some((pos.x, self.graph_view_start));
-          }
-          if response.dragged()
-            && let (Some((ox, ostart)), Some(pos)) = (self.graph_drag_origin, response.interact_pointer_pos())
-          {
-            let dx = (pos.x - ox) as f64 / plot_w as f64;
-            let mut new_start = ostart - dx * self.graph_view_span;
-            new_start = new_start.clamp(0.0, (1.0 - self.graph_view_span).max(0.0));
-            self.graph_view_start = new_start;
-          }
-          if response.drag_stopped() {
-            self.graph_drag_origin = None;
-          }
-
-          if response.double_clicked() {
-            self.graph_view_start = 0.0;
-            self.graph_view_span = 1.0;
-          }
-
-          let has_data = total_samples >= 2;
-          let (vis_lo, vis_hi) = if has_data {
-            let lo = (self.graph_view_start * (total_samples - 1) as f64).floor() as usize;
-            let hi = ((self.graph_view_start + self.graph_view_span) * (total_samples - 1) as f64).ceil() as usize;
-            (lo.min(total_samples - 1), hi.min(total_samples - 1).max(lo + 1))
-          } else {
-            (0, 0)
-          };
-
-          let visible: Vec<(usize, f64, String)> = if has_data {
-            history[vis_lo..=vis_hi]
-              .iter()
-              .enumerate()
-              .map(|(i, (s, clock))| (vis_lo + i, *s, clock.clone()))
-              .collect()
-          } else {
-            Vec::new()
-          };
-
-          let (y_min, y_max) = if !visible.is_empty() {
-            let raw_min = visible.iter().map(|(_, s, _)| *s).fold(f64::INFINITY, f64::min);
-            let raw_max = visible
-              .iter()
-              .map(|(_, s, _)| *s)
-              .fold(0.0_f64, f64::max)
-              .max(if self.graph_view_span >= 0.99 { max_ever } else { 0.0 });
-
-            let mut span = (raw_max - raw_min).max(raw_max * 0.05).max(0.01);
-            if span < raw_max * 0.15 {
-              span = raw_max * 0.15;
-            }
-            let mid = (raw_min + raw_max) * 0.5;
-            let mut y_min = (mid - span * 0.6).max(0.0);
-            let mut y_max = mid + span * 0.6;
-            if y_max <= y_min {
-              y_max = y_min + 0.01;
-            }
-            if raw_max > y_max {
-              y_max = raw_max * 1.05;
-            }
-            if raw_min < y_min {
-              y_min = (raw_min * 0.95).max(0.0);
-            }
-            (y_min, y_max)
-          } else {
-            (0.0, 1.0)
-          };
-
-          let num_lines = 5;
-          for i in 0..num_lines {
-            let t = i as f32 / (num_lines - 1) as f32;
-            let y = plot_bottom - t * plot_h;
-            painter.line_segment(
-              [egui::pos2(plot_left, y), egui::pos2(plot_right, y)],
-              egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 48)),
-            );
-            let label_v = y_min + (y_max - y_min) * t as f64;
-            painter.text(
-              egui::pos2(plot_left - 4.0, y),
-              egui::Align2::RIGHT_CENTER,
-              format_speed(label_v),
-              egui::FontId::monospace(10.0),
-              egui::Color32::from_rgb(120, 120, 130),
-            );
-          }
-
-          if has_data && total_secs > 0.0 {
-            let view_t0 = self.graph_view_start * total_secs;
-            let view_t1 = (self.graph_view_start + self.graph_view_span) * total_secs;
-            let view_dur = (view_t1 - view_t0).max(0.001);
-            let nice_steps = [
-              1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0,
-            ];
-            let target = view_dur / 5.0;
-            let mut step = nice_steps[0];
-            for &s in &nice_steps {
-              step = s;
-              if s >= target {
-                break;
-              }
-            }
-            let first = (view_t0 / step).ceil() * step;
-            let mut t = first;
-            while t <= view_t1 + 0.001 {
-              let frac = ((t - view_t0) / view_dur) as f32;
-              let x = plot_left + frac.clamp(0.0, 1.0) * plot_w;
-              painter.line_segment(
-                [egui::pos2(x, plot_bottom), egui::pos2(x, plot_bottom + 4.0)],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 90)),
-              );
-              painter.text(
-                egui::pos2(x, plot_bottom + 6.0),
-                egui::Align2::CENTER_TOP,
-                format_duration(t),
-                egui::FontId::monospace(9.0),
-                egui::Color32::from_rgb(120, 120, 130),
-              );
-              t += step;
-            }
-          }
-
-          if has_data && !visible.is_empty() {
-            if max_ever > 0.0 && y_max > y_min && self.graph_view_span >= 0.99 {
-              let t_max = ((max_ever - y_min) / (y_max - y_min)) as f32;
-              let y_max_line = plot_bottom - t_max.clamp(0.0, 1.0) * plot_h;
-              let mut x = plot_left;
-              let dash = 6.0;
-              let gap = 4.0;
-              while x < plot_right {
-                let x2 = (x + dash).min(plot_right);
-                painter.line_segment(
-                  [egui::pos2(x, y_max_line), egui::pos2(x2, y_max_line)],
-                  egui::Stroke::new(1.5, egui::Color32::from_rgb(60, 140, 255)),
-                );
-                x += dash + gap;
-              }
-              painter.text(
-                egui::pos2(plot_right - 2.0, y_max_line - 2.0),
-                egui::Align2::RIGHT_BOTTOM,
-                format!("max {}", format_speed(max_ever)),
-                egui::FontId::monospace(10.0),
-                egui::Color32::from_rgb(60, 140, 255),
-              );
-            }
-
-            let target_points = (plot_w as usize).max(2).min(visible.len());
-            let mut points = Vec::with_capacity(target_points);
-            let n = (target_points - 1) as f32;
-            let current_speed = visible.last().map(|(_, s, _)| *s).unwrap_or(0.0);
-
-            for i in 0..target_points {
-              let src_idx = if target_points == visible.len() {
-                i
-              } else {
-                (i as f64 * (visible.len() - 1) as f64 / (target_points - 1) as f64).round() as usize
-              };
-              let (_, v, _) = visible[src_idx.min(visible.len() - 1)];
-              let x = plot_left + (i as f32 / n) * plot_w;
-              let t = ((v - y_min) / (y_max - y_min)) as f32;
-              let y = plot_bottom - t.clamp(0.0, 1.0) * plot_h;
-              points.push(egui::pos2(x, y));
-            }
-
-            painter.add(egui::Shape::line(
-              points.clone(),
-              egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 120)),
-            ));
-
-            if let Some(last) = points.last() {
-              painter.circle_filled(*last, 3.5, egui::Color32::from_rgb(0, 200, 120));
-              painter.text(
-                egui::pos2(last.x - 4.0, last.y + 4.0),
-                egui::Align2::RIGHT_TOP,
-                format!("now {}", format_speed(current_speed)),
-                egui::FontId::monospace(10.0),
-                egui::Color32::from_rgb(0, 200, 120),
-              );
-            }
-
-            if let Some(pointer) = response.hover_pos()
-              && pointer.x >= plot_left
-              && pointer.x <= plot_right
-              && pointer.y >= plot_top
-              && pointer.y <= plot_bottom
-            {
-              let frac = ((pointer.x - plot_left) / plot_w).clamp(0.0, 1.0);
-              let idx_in_vis = (frac * (visible.len() - 1) as f32).round() as usize;
-              let idx_in_vis = idx_in_vis.min(visible.len() - 1);
-              let (_global_idx, speed, ref clock) = visible[idx_in_vis];
-              let x = plot_left + (idx_in_vis as f32 / (visible.len() - 1).max(1) as f32) * plot_w;
-              let ty = ((speed - y_min) / (y_max - y_min)) as f32;
-              let y = plot_bottom - ty.clamp(0.0, 1.0) * plot_h;
-
-              painter.line_segment(
-                [egui::pos2(x, plot_top), egui::pos2(x, plot_bottom)],
-                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(200, 200, 220, 80)),
-              );
-              painter.circle_filled(egui::pos2(x, y), 4.0, egui::Color32::from_rgb(220, 220, 240));
-              painter.circle_filled(egui::pos2(x, y), 2.5, egui::Color32::from_rgb(0, 200, 120));
-
-              let tip = format!("{}  *  {}", format_speed(speed), clock);
-              let tip_pos = egui::pos2(x + 8.0, y - 8.0);
-              let galley = painter.layout_no_wrap(tip, egui::FontId::monospace(11.0), egui::Color32::from_rgb(230, 230, 240));
-              let pad = egui::vec2(6.0, 4.0);
-              let mut box_rect = egui::Rect::from_min_size(tip_pos, galley.size() + pad * 2.0);
-              if box_rect.right() > plot_right {
-                box_rect = box_rect.translate(egui::vec2(plot_right - box_rect.right(), 0.0));
-              }
-              if box_rect.top() < plot_top {
-                box_rect = box_rect.translate(egui::vec2(0.0, plot_top - box_rect.top() + 4.0));
-              }
-              painter.rect_filled(box_rect, 3.0, egui::Color32::from_rgba_unmultiplied(20, 20, 28, 220));
-              painter.galley(box_rect.min + pad, galley, egui::Color32::from_rgb(230, 230, 240));
-            }
-
-            if self.graph_view_span < 0.999 {
-              let zoom_pct = ((1.0 - self.graph_view_span) / 0.98 * 100.0).clamp(0.0, 100.0);
-              let label = format!("zoom {:.0}%  (double-click reset)", zoom_pct);
-              painter.text(
-                egui::pos2(plot_left + 4.0, plot_top + 2.0),
-                egui::Align2::LEFT_TOP,
-                label,
-                egui::FontId::monospace(9.0),
-                egui::Color32::from_rgb(140, 140, 160),
-              );
-            }
-          } else {
-            let t = ui.input(|i| i.time) as f32;
-            let steps = 64;
-            let mut points = Vec::with_capacity(steps + 1);
-            let y_mid = (plot_top + plot_bottom) * 0.5;
-            let amp = plot_h * 0.03;
-            for i in 0..=steps {
-              let x_t = i as f32 / steps as f32;
-              let x = plot_left + x_t * plot_w;
-              let wave = ((x_t * std::f32::consts::TAU * 1.5) + t * 2.0).sin() * amp;
-              points.push(egui::pos2(x, y_mid + wave));
-            }
-            painter.add(egui::Shape::line(
-              points,
-              egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(0, 200, 120, 90)),
-            ));
-          }
-        }
-
-        ui.horizontal(|ui| {
-          let graph_btn_text = if self.graph_enabled { "Hide Graph" } else { "Show Graph" };
-          if ui.button(graph_btn_text).clicked() {
-            self.graph_enabled = !self.graph_enabled;
-            if !self.graph_enabled {
-              self.speed_history.clear();
-              self.max_speed_ever = 0.0;
-              self.graph_view_start = 0.0;
-              self.graph_view_span = 1.0;
-              self.graph_drag_origin = None;
-            } else {
-              self.last_speed_sample = Instant::now();
-            }
-          }
-
-          ui.separator();
-
-          let speed_btn_text = if self.use_live_speed { "Speed: Live" } else { "Speed: Global" };
-          if ui
-            .button(speed_btn_text)
-            .on_hover_text("Toggle between live worker speed and global average speed")
-            .clicked()
-          {
-            self.use_live_speed = !self.use_live_speed;
-          }
-
-          ui.separator();
-
-          ui.label("History:");
-          let history_options: &[(u32, &str)] = &[(30, "30s"), (60, "1m"), (120, "2m"), (180, "3m"), (300, "5m")];
-
-          for &(secs, label) in history_options {
-            let selected = self.graph_history_secs == secs;
-            if ui.selectable_label(selected, label).clicked() {
-              self.graph_history_secs = secs;
-              const SAMPLE_SECS: f64 = 0.25;
-              let max_samples = ((secs as f64) / SAMPLE_SECS).ceil() as usize;
-              while self.speed_history.len() > max_samples.max(2) {
-                self.speed_history.pop_front();
-              }
-            }
-          }
-        });
-      });
-
-    egui::CentralPanel::default().show(ui, |ui| {
-      let avail_w = ui.available_width();
-      ui.set_min_width(avail_w);
-
-      if self.kernels_loading {
-        ui.add_space(MARGIN_NARROW);
-        ui.horizontal(|ui| {
-          ui.label(egui::RichText::new("Loading kernels").color(COL_ACCENT).strong());
-          if !self.kernels_load_stage.is_empty() {
-            ui.label(egui::RichText::new(format!("  {}", self.kernels_load_stage)).color(COL_GPU));
-          }
-        });
-
-        let bar = egui::ProgressBar::new(self.kernels_load_progress.clamp(0.0, 1.0))
-          .desired_width(avail_w)
-          .show_percentage()
-          .animate(true);
-
-        ui.add(bar);
-      } else if self.selected_puzzle == ALL_PUZZLES {
-        let all_prog = state.all_progress;
-        let cur_puz = state.all_current_puzzle;
-        let sweep = state.all_sweep;
-        let total_p = state.all_total_puzzles;
-        ui.horizontal(|ui| {
-          ui.label(egui::RichText::new("ALL sweep").color(COL_ACCENT).strong());
-          if cur_puz != 0 {
-            ui.label(egui::RichText::new(format!("  now: #{}", cur_puz)).color(COL_GPU));
-          }
-          if total_p > 0 {
-            ui.label(egui::RichText::new(format!("  ({:.0}% of {} puzzles)", all_prog, total_p)).small());
-          }
-          if sweep > 0 {
-            ui.label(egui::RichText::new(format!("  sweep {}", sweep)).small().color(egui::Color32::GRAY));
-          }
-          ui.separator();
-          ui.label(egui::RichText::new("turn").small());
-          let mut secs = self.all_turn_secs;
-          egui::ComboBox::from_id_salt("all_turn_secs")
-            .selected_text(format!("{}s", secs))
-            .width(52.0)
-            .show_ui(ui, |ui| {
-              for &opt in &ALL_MODE_TURN_SECS_OPTIONS {
-                ui.selectable_value(&mut secs, opt, format!("{}s", opt));
-              }
-            });
-          if secs != self.all_turn_secs {
-            self.all_turn_secs = secs;
-            self.all_turn_secs_atomic.store(secs, Ordering::Relaxed);
-            if self.running && is_all_mode(self.selected_puzzle) {
-              arm_all_mode_turn(secs.max(1));
-              crate::app_log!("[ALL] live turn duration → {}s (timer reset for current puzzle)", secs);
-            }
-          }
-          ui.label(egui::RichText::new("per puzzle").small().color(egui::Color32::GRAY))
-            .on_hover_text(
-              "How long each puzzle runs before rotating to the next.\n\
-Can be changed while running - takes effect immediately (timer restarts).\n\
-Workers finish the current chunk after the timer, then GLOBAL_NEXT / ALLOC.log are saved.",
-            );
-        });
-        let bar = egui::ProgressBar::new((all_prog / 100.0).clamp(0.0, 1.0) as f32)
-          .desired_width(avail_w)
-          .show_percentage();
-        ui.add(bar);
-      }
-
-      egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .id_salt("workers_table_scroll")
-        .show(ui, |ui| {
-          ui.set_min_width(avail_w);
-
-          let min_model = 100.0;
-          let min_index = 100.0;
-          let min_key = 100.0;
-
-          let w_device = 70.0;
-          let w_units = 70.0;
-          let w_clock = 90.0;
-          let w_checked = 90.0;
-          let w_speed = 150.0;
-
-          let fixed_sum = w_device + w_units + w_clock + w_checked + w_speed;
-          let remaining = (avail_w - fixed_sum).max(0.0);
-
-          let w_model = (remaining * 0.20).max(min_model);
-          let w_index = (remaining * 0.40).max(min_index);
-          let w_key = (remaining * 0.40).max(min_key);
-
-          let total = w_device + w_model + w_units + w_clock + w_index + w_key + w_checked + w_speed;
-          let scale = if total > avail_w && total > 0.0 { avail_w / total } else { 1.0 };
-
-          TableBuilder::new(ui)
-            .striped(true)
-            .resizable(false)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(w_device * scale).clip(true))
-            .column(Column::exact(w_model * scale).clip(true))
-            .column(Column::exact(w_units * scale).clip(true))
-            .column(Column::exact(w_clock * scale).clip(true))
-            .column(Column::exact(w_index * scale).clip(true))
-            .column(Column::exact(w_key * scale).clip(true))
-            .column(Column::exact(w_checked * scale).clip(true))
-            .column(Column::exact(w_speed * scale).clip(true))
-            .header(26.0, |mut header| {
-              for title in ["Device", "Model", "Units", "Clock", "Index", "Key", "Checked", "Speed"] {
-                header.col(|ui| {
-                  ui.strong(egui::RichText::new(title).color(COL_ACCENT));
-                });
-              }
-            })
-            .body(|mut body| {
-              for row in state.workers.iter() {
-                body.row(20.0, |mut table_row| {
-                  table_row.col(|ui| {
-                    let color = if row.device.starts_with("GPU") { COL_GPU } else { COL_CPU };
-                    ui.colored_label(color, &row.device);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(&row.model);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(&row.units);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(&row.clock);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(&row.index_hex);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(&row.key_hex);
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(format_count(row.checked));
-                  });
-                  table_row.col(|ui| {
-                    ui.monospace(format_speed(row.speed_kps));
-                  });
-                });
-              }
-            });
-        });
-    });
-
-    drop(state);
-
-    self.draw_buy_window(ui.ctx());
-    self.draw_log_window(ui.ctx());
-    self.draw_settings_window(ui.ctx());
-    self.draw_help_window(ui.ctx());
-
-    ui.ctx().request_repaint_after(Duration::from_millis(UI_REFRESH_INTERVAL_MS));
-  }
-}
-
-impl KeyHunterApp {
   fn draw_settings_window(
     &mut self,
     ctx: &egui::Context,
@@ -5804,42 +5846,4 @@ impl KeyHunterApp {
   }
 }
 
-fn format_speed(v: f64) -> String {
-  if v < 0.001 {
-    "0".to_string()
-  } else if v < 1.0 {
-    format!("{:.0}", v * 1000.0)
-  } else if v < 1000.0 {
-    format!("{:.1} K", v)
-  } else if v < 1_000_000.0 {
-    format!("{:.1} M", v / 1000.0)
-  } else {
-    format!("{:.1} G", v / 1_000_000.0)
-  }
-}
-
-fn format_duration(secs: f64) -> String {
-  let s = secs.max(0.0) as u64;
-  let h = s / 3600;
-  let m = (s % 3600) / 60;
-  let sec = s % 60;
-  if h > 0 {
-    format!("{}h{:02}m", h, m)
-  } else if m > 0 {
-    format!("{}m{:02}s", m, sec)
-  } else {
-    format!("{}s", sec)
-  }
-}
-
-fn format_count(n: u64) -> String {
-  if n < 1000 {
-    format!("{}", n)
-  } else if n < 1_000_000 {
-    format!("{:.1} K", n as f64 / 1000.0)
-  } else if n < 1_000_000_000 {
-    format!("{:.1} M", n as f64 / 1_000_000.0)
-  } else {
-    format!("{:.1} G", n as f64 / 1_000_000_000.0)
-  }
-}
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..

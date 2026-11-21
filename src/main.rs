@@ -29,6 +29,7 @@
 //
 //    -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
 
+use chrono::Local;
 use cudarc::{
   driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg, result,
@@ -58,10 +59,10 @@ use std::{
   fs::{self, File, OpenOptions},
   time::Duration,
 };
+use zeroize::Zeroize;
 
 mod gui;
 mod kernel;
-
 #[cfg(any(test, feature = "test_vectors"))]
 mod test_vector;
 
@@ -69,328 +70,27 @@ const APP_NAME: Option<&str> = option_env!("CARGO_PKG_NAME");
 const APP_VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 const BACKUPS_DIR: &str = "backups";
 const STATUS_DIR: &str = "status";
-pub const UI_REFRESH_INTERVAL_MS: u64 = 200;
 const PROGRESS_SAVE_INTERVAL_SEC: u64 = 10;
 const CPU_PARALLEL_KEYS: usize = 64;
 const CPU_CHUNK_SIZE: u128 = (CPU_PARALLEL_KEYS as u128) * 64;
 const GPU_TEST_MODE: bool = false;
 const BABY_TABLE_BITS: u32 = 22;
+const GLOW_CURVE: [u8; 32] = [
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+  0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+pub const UI_REFRESH_INTERVAL_MS: u64 = 200;
 pub const DEFAULT_PUZZLE: u32 = 71;
 pub const ALL_PUZZLES: u32 = 0;
 pub const ALL_MODE_DEFAULT_TURN_SECS: u64 = 15;
 pub const ALL_MODE_TURN_SECS_OPTIONS: [u64; 5] = [5, 10, 15, 30, 60];
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct U256 {
-  pub lo: u128,
-  pub hi: u128,
-}
-
-impl U256 {
-  pub const ZERO: U256 = U256 { lo: 0, hi: 0 };
-  pub const ONE: U256 = U256 { lo: 1, hi: 0 };
-
-  #[inline]
-  pub fn from_u128(v: u128) -> Self {
-    Self { lo: v, hi: 0 }
-  }
-
-  pub fn from_hex(s: &str) -> Self {
-    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if s.is_empty() {
-      return Self::ZERO;
-    }
-
-    if s.len() <= 32 {
-      let lo = u128::from_str_radix(s, 16).expect("valid hex");
-      return Self { lo, hi: 0 };
-    }
-
-    let hi_len = s.len() - 32;
-    let hi = u128::from_str_radix(&s[..hi_len], 16).expect("valid hex hi");
-    let lo = u128::from_str_radix(&s[hi_len..], 16).expect("valid hex lo");
-    Self { lo, hi }
-  }
-
-  #[inline]
-  pub fn bit(bit: u32) -> Self {
-    debug_assert!(bit < 256);
-    if bit < 128 {
-      Self { lo: 1u128 << bit, hi: 0 }
-    } else {
-      Self {
-        lo: 0,
-        hi: 1u128 << (bit - 128),
-      }
-    }
-  }
-
-  #[inline]
-  pub fn saturating_add(
-    self,
-    rhs: Self,
-  ) -> Self {
-    let (lo, c) = self.lo.overflowing_add(rhs.lo);
-    let hi = self.hi.saturating_add(rhs.hi).saturating_add(c as u128);
-    Self { lo, hi }
-  }
-
-  #[inline]
-  pub fn wrapping_add(
-    self,
-    rhs: Self,
-  ) -> Self {
-    let (lo, c) = self.lo.overflowing_add(rhs.lo);
-    let hi = self.hi.wrapping_add(rhs.hi).wrapping_add(c as u128);
-    Self { lo, hi }
-  }
-
-  #[inline]
-  pub fn wrapping_mul(
-    self,
-    rhs: Self,
-  ) -> Self {
-    let (ll_lo, ll_hi) = umul128(self.lo, rhs.lo);
-    let cross = self.lo.wrapping_mul(rhs.hi).wrapping_add(self.hi.wrapping_mul(rhs.lo));
-    Self {
-      lo: ll_lo,
-      hi: ll_hi.wrapping_add(cross),
-    }
-  }
-
-  #[inline]
-  pub fn saturating_sub(
-    self,
-    rhs: Self,
-  ) -> Self {
-    if self < rhs {
-      return Self::ZERO;
-    }
-    let (lo, b) = self.lo.overflowing_sub(rhs.lo);
-    let hi = self.hi - rhs.hi - (b as u128);
-    Self { lo, hi }
-  }
-
-  #[inline]
-  pub fn bit_and(
-    self,
-    rhs: Self,
-  ) -> Self {
-    Self {
-      lo: self.lo & rhs.lo,
-      hi: self.hi & rhs.hi,
-    }
-  }
-
-  #[inline]
-  pub fn fits_u128(self) -> bool {
-    self.hi == 0
-  }
-
-  #[inline]
-  pub fn as_u128(self) -> Option<u128> {
-    if self.hi == 0 { Some(self.lo) } else { None }
-  }
-
-  pub fn to_be_bytes(self) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(&self.hi.to_be_bytes());
-    out[16..].copy_from_slice(&self.lo.to_be_bytes());
-    out
-  }
-
-  pub fn to_hex(self) -> String {
-    if self.hi == 0 {
-      format!("{:X}", self.lo)
-    } else {
-      format!("{:X}{:032X}", self.hi, self.lo)
-    }
-  }
-
-  #[inline]
-  pub fn wrapping_add_u128(
-    self,
-    rhs: u128,
-  ) -> Self {
-    let (lo, c) = self.lo.overflowing_add(rhs);
-    Self {
-      lo,
-      hi: self.hi.wrapping_add(c as u128),
-    }
-  }
-
-  #[inline]
-  pub fn saturating_add_u128(
-    self,
-    rhs: u128,
-  ) -> Self {
-    let (lo, c) = self.lo.overflowing_add(rhs);
-    let (hi, o) = self.hi.overflowing_add(c as u128);
-    if o {
-      Self {
-        lo: u128::MAX,
-        hi: u128::MAX,
-      }
-    } else {
-      Self { lo, hi }
-    }
-  }
-
-  #[inline]
-  pub fn saturating_sub_u128(
-    self,
-    rhs: u128,
-  ) -> Self {
-    if self.hi == 0 {
-      Self {
-        lo: self.lo.saturating_sub(rhs),
-        hi: 0,
-      }
-    } else {
-      let (lo, b) = self.lo.overflowing_sub(rhs);
-      Self {
-        lo,
-        hi: self.hi - (b as u128),
-      }
-    }
-  }
-
-  #[inline]
-  pub fn is_zero(self) -> bool {
-    self.lo == 0 && self.hi == 0
-  }
-
-  #[inline]
-  pub fn cmp_u128(
-    self,
-    rhs: u128,
-  ) -> std::cmp::Ordering {
-    if self.hi != 0 { std::cmp::Ordering::Greater } else { self.lo.cmp(&rhs) }
-  }
-
-  #[inline]
-  pub fn min(
-    self,
-    other: Self,
-  ) -> Self {
-    if self <= other { self } else { other }
-  }
-
-  #[inline]
-  pub fn max(
-    self,
-    other: Self,
-  ) -> Self {
-    if self >= other { self } else { other }
-  }
-}
-
-impl PartialOrd for U256 {
-  fn partial_cmp(
-    &self,
-    other: &Self,
-  ) -> Option<std::cmp::Ordering> {
-    Some(self.cmp(other))
-  }
-}
-
-impl Ord for U256 {
-  fn cmp(
-    &self,
-    other: &Self,
-  ) -> std::cmp::Ordering {
-    match self.hi.cmp(&other.hi) {
-      std::cmp::Ordering::Equal => self.lo.cmp(&other.lo),
-      o => o,
-    }
-  }
-}
-
-impl std::fmt::Display for U256 {
-  fn fmt(
-    &self,
-    f: &mut std::fmt::Formatter<'_>,
-  ) -> std::fmt::Result {
-    f.write_str(&self.to_hex())
-  }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PuzzleInfo {
-  pub number: u32,
-  pub n_bits: u32,
-  pub range_start_hex: &'static str,
-  pub address: &'static str,
-  pub hash160: [u8; 20],
-  pub pubkey_hex: Option<&'static str>,
-}
-
-impl PuzzleInfo {
-  #[inline]
-  pub fn range_start(&self) -> U256 {
-    U256::from_hex(self.range_start_hex)
-  }
-
-  #[inline]
-  pub fn total_keys(&self) -> U256 {
-    U256::bit(self.n_bits)
-  }
-
-  #[inline]
-  pub fn n_mask(&self) -> U256 {
-    self.total_keys().saturating_sub(U256::ONE)
-  }
-
-  #[inline]
-  pub fn range_end(&self) -> U256 {
-    let start = self.range_start();
-    let mask = self.n_mask();
-
-    U256 {
-      lo: start.lo | mask.lo,
-      hi: start.hi | mask.hi,
-    }
-  }
-
-  #[inline]
-  pub fn fits_u128(&self) -> bool {
-    self.n_bits <= 127
-  }
-
-  #[inline]
-  pub fn range_start_u128(&self) -> Option<u128> {
-    self.range_start().as_u128()
-  }
-
-  #[inline]
-  pub fn total_keys_u128(&self) -> Option<u128> {
-    self.total_keys().as_u128()
-  }
-
-  #[inline]
-  pub fn n_mask_u128(&self) -> Option<u128> {
-    self.n_mask().as_u128()
-  }
-
-  #[inline]
-  pub fn has_pubkey(&self) -> bool {
-    self.pubkey_hex.is_some()
-  }
-
-  pub fn pubkey_compressed(&self) -> Option<[u8; 33]> {
-    let h = self.pubkey_hex?;
-    if h.len() != 66 {
-      return None;
-    }
-
-    let mut out = [0u8; 33];
-    for i in 0..33 {
-      out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(out)
-  }
-}
-
+static BENCH_CANCEL: AtomicBool = AtomicBool::new(false);
+static TOTAL_CHECKED_LOW: AtomicU64 = AtomicU64::new(0);
+static TOTAL_CHECKED_HIGH: AtomicU64 = AtomicU64::new(0);
+static FOUND: AtomicBool = AtomicBool::new(false);
+static PANIC_OCCURRED: AtomicBool = AtomicBool::new(false);
+static ALL_MODE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 pub static UNSOLVED_PUZZLES: &[PuzzleInfo] = &[
   PuzzleInfo {
     number: 71,
@@ -1163,38 +863,9 @@ pub static UNSOLVED_PUZZLES: &[PuzzleInfo] = &[
     pubkey_hex: Some("02e0a8b039282faf6fe0fd769cfbc4b6b4cf8758ba68220eac420e32b91ddfa673"),
   },
 ];
+pub static ACTIVE_PACKAGE: std::sync::Mutex<Option<KernelRegistry>> = std::sync::Mutex::new(None);
 
-pub fn active_puzzles() -> &'static [PuzzleInfo] {
-  #[cfg(feature = "test_vectors")]
-  {
-    crate::test_vector::test_puzzle_infos()
-  }
-
-  #[cfg(not(feature = "test_vectors"))]
-  {
-    UNSOLVED_PUZZLES
-  }
-}
-
-pub fn puzzle_by_number(n: u32) -> Option<&'static PuzzleInfo> {
-  active_puzzles().iter().find(|p| p.number == n)
-}
-
-pub fn default_puzzle() -> &'static PuzzleInfo {
-  puzzle_by_number(DEFAULT_PUZZLE).expect("default puzzle 72 is in the table")
-}
-
-static TOTAL_CHECKED_LOW: AtomicU64 = AtomicU64::new(0);
-static TOTAL_CHECKED_HIGH: AtomicU64 = AtomicU64::new(0);
-static FOUND: AtomicBool = AtomicBool::new(false);
-static PANIC_OCCURRED: AtomicBool = AtomicBool::new(false);
-static ALL_MODE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SearchMode {
-  Sequence,
-  Pcg,
-}
+pub type BenchProgressFn = Box<dyn Fn(usize, usize, &str, Option<f64>) + Send>;
 
 lazy_static::lazy_static! {
   static ref DASHBOARD: Arc<Mutex<Vec<ThreadStatus>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1203,74 +874,329 @@ lazy_static::lazy_static! {
   static ref LAST_GPU_ERROR: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 }
 
-static BENCH_CANCEL: AtomicBool = AtomicBool::new(false);
-
-pub fn request_bench_cancel() {
-  BENCH_CANCEL.store(true, Ordering::Relaxed);
-}
-
-pub fn clear_bench_cancel() {
-  BENCH_CANCEL.store(false, Ordering::Relaxed);
-}
-
-pub fn bench_cancel_requested() -> bool {
-  BENCH_CANCEL.load(Ordering::Relaxed)
-}
-
-pub fn report_gpu_error(msg: impl Into<String>) {
-  let m = msg.into();
-  crate::app_log!("{}", m);
-  if let Ok(mut slot) = LAST_GPU_ERROR.lock() {
-    *slot = m;
-  }
-}
-
-pub fn take_gpu_error(clear: bool) -> Option<String> {
-  let Ok(mut slot) = LAST_GPU_ERROR.lock() else {
-    return None;
-  };
-
-  if slot.is_empty() {
-    return None;
-  }
-
-  let out = slot.clone();
-  if clear {
-    slot.clear();
-  }
-
-  Some(out)
-}
-
-pub fn clear_gpu_error() {
-  if let Ok(mut slot) = LAST_GPU_ERROR.lock() {
-    slot.clear();
-  }
-}
-
-fn format_cuda_oom_or(
-  action: &str,
-  device_hint: &str,
-  err: impl std::fmt::Debug,
-) -> Box<dyn std::error::Error> {
-  let s = format!("{:?}", err);
-  let lower = s.to_lowercase();
-  if lower.contains("out of memory") || lower.contains("cuda_error_out_of_memory") {
-    format!(
-      "GPU out of memory while trying to {} on {}. \
-The selected kernel size / keys-per-thread is too large for this GPU's VRAM or local memory. \
-Try a smaller size or lower parallel keys. \
-Driver detail: {}",
-      action, device_hint, s
-    )
-    .into()
-  } else {
-    format!("CUDA error while trying to {} on {}: {:?}", action, device_hint, err).into()
-  }
-}
-
 thread_local! {
   static LOCAL_SECP: Secp256k1<secp256k1::All> = Secp256k1::new();
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct U256 {
+  pub lo: u128,
+  pub hi: u128,
+}
+
+impl U256 {
+  pub const ZERO: U256 = U256 { lo: 0, hi: 0 };
+  pub const ONE: U256 = U256 { lo: 1, hi: 0 };
+
+  #[inline]
+  pub fn from_u128(v: u128) -> Self {
+    Self { lo: v, hi: 0 }
+  }
+
+  pub fn from_hex(s: &str) -> Self {
+    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if s.is_empty() {
+      return Self::ZERO;
+    }
+
+    if s.len() <= 32 {
+      let lo = u128::from_str_radix(s, 16).expect("valid hex");
+      return Self { lo, hi: 0 };
+    }
+
+    let hi_len = s.len() - 32;
+    let hi = u128::from_str_radix(&s[..hi_len], 16).expect("valid hex hi");
+    let lo = u128::from_str_radix(&s[hi_len..], 16).expect("valid hex lo");
+    Self { lo, hi }
+  }
+
+  #[inline]
+  pub fn bit(bit: u32) -> Self {
+    debug_assert!(bit < 256);
+    if bit < 128 {
+      Self { lo: 1u128 << bit, hi: 0 }
+    } else {
+      Self {
+        lo: 0,
+        hi: 1u128 << (bit - 128),
+      }
+    }
+  }
+
+  #[inline]
+  pub fn saturating_add(
+    self,
+    rhs: Self,
+  ) -> Self {
+    let (lo, c) = self.lo.overflowing_add(rhs.lo);
+    let hi = self.hi.saturating_add(rhs.hi).saturating_add(c as u128);
+    Self { lo, hi }
+  }
+
+  #[inline]
+  pub fn wrapping_add(
+    self,
+    rhs: Self,
+  ) -> Self {
+    let (lo, c) = self.lo.overflowing_add(rhs.lo);
+    let hi = self.hi.wrapping_add(rhs.hi).wrapping_add(c as u128);
+    Self { lo, hi }
+  }
+
+  #[inline]
+  pub fn wrapping_mul(
+    self,
+    rhs: Self,
+  ) -> Self {
+    let (ll_lo, ll_hi) = umul128(self.lo, rhs.lo);
+    let cross = self.lo.wrapping_mul(rhs.hi).wrapping_add(self.hi.wrapping_mul(rhs.lo));
+    Self {
+      lo: ll_lo,
+      hi: ll_hi.wrapping_add(cross),
+    }
+  }
+
+  #[inline]
+  pub fn saturating_sub(
+    self,
+    rhs: Self,
+  ) -> Self {
+    if self < rhs {
+      return Self::ZERO;
+    }
+    let (lo, b) = self.lo.overflowing_sub(rhs.lo);
+    let hi = self.hi - rhs.hi - (b as u128);
+    Self { lo, hi }
+  }
+
+  #[inline]
+  pub fn bit_and(
+    self,
+    rhs: Self,
+  ) -> Self {
+    Self {
+      lo: self.lo & rhs.lo,
+      hi: self.hi & rhs.hi,
+    }
+  }
+
+  #[inline]
+  pub fn fits_u128(self) -> bool {
+    self.hi == 0
+  }
+
+  #[inline]
+  pub fn as_u128(self) -> Option<u128> {
+    if self.hi == 0 { Some(self.lo) } else { None }
+  }
+
+  pub fn to_be_bytes(self) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&self.hi.to_be_bytes());
+    out[16..].copy_from_slice(&self.lo.to_be_bytes());
+    out
+  }
+
+  pub fn to_hex(self) -> String {
+    if self.hi == 0 {
+      format!("{:X}", self.lo)
+    } else {
+      format!("{:X}{:032X}", self.hi, self.lo)
+    }
+  }
+
+  #[inline]
+  pub fn wrapping_add_u128(
+    self,
+    rhs: u128,
+  ) -> Self {
+    let (lo, c) = self.lo.overflowing_add(rhs);
+    Self {
+      lo,
+      hi: self.hi.wrapping_add(c as u128),
+    }
+  }
+
+  #[inline]
+  pub fn saturating_add_u128(
+    self,
+    rhs: u128,
+  ) -> Self {
+    let (lo, c) = self.lo.overflowing_add(rhs);
+    let (hi, o) = self.hi.overflowing_add(c as u128);
+    if o {
+      Self {
+        lo: u128::MAX,
+        hi: u128::MAX,
+      }
+    } else {
+      Self { lo, hi }
+    }
+  }
+
+  #[inline]
+  pub fn saturating_sub_u128(
+    self,
+    rhs: u128,
+  ) -> Self {
+    if self.hi == 0 {
+      Self {
+        lo: self.lo.saturating_sub(rhs),
+        hi: 0,
+      }
+    } else {
+      let (lo, b) = self.lo.overflowing_sub(rhs);
+      Self {
+        lo,
+        hi: self.hi - (b as u128),
+      }
+    }
+  }
+
+  #[inline]
+  pub fn is_zero(self) -> bool {
+    self.lo == 0 && self.hi == 0
+  }
+
+  #[inline]
+  pub fn cmp_u128(
+    self,
+    rhs: u128,
+  ) -> std::cmp::Ordering {
+    if self.hi != 0 { std::cmp::Ordering::Greater } else { self.lo.cmp(&rhs) }
+  }
+
+  #[inline]
+  pub fn min(
+    self,
+    other: Self,
+  ) -> Self {
+    if self <= other { self } else { other }
+  }
+
+  #[inline]
+  pub fn max(
+    self,
+    other: Self,
+  ) -> Self {
+    if self >= other { self } else { other }
+  }
+}
+
+impl PartialOrd for U256 {
+  fn partial_cmp(
+    &self,
+    other: &Self,
+  ) -> Option<std::cmp::Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Ord for U256 {
+  fn cmp(
+    &self,
+    other: &Self,
+  ) -> std::cmp::Ordering {
+    match self.hi.cmp(&other.hi) {
+      std::cmp::Ordering::Equal => self.lo.cmp(&other.lo),
+      o => o,
+    }
+  }
+}
+
+impl std::fmt::Display for U256 {
+  fn fmt(
+    &self,
+    f: &mut std::fmt::Formatter<'_>,
+  ) -> std::fmt::Result {
+    f.write_str(&self.to_hex())
+  }
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
+#[derive(Clone, Copy, Debug)]
+pub struct PuzzleInfo {
+  pub number: u32,
+  pub n_bits: u32,
+  pub range_start_hex: &'static str,
+  pub address: &'static str,
+  pub hash160: [u8; 20],
+  pub pubkey_hex: Option<&'static str>,
+}
+
+impl PuzzleInfo {
+  #[inline]
+  pub fn range_start(&self) -> U256 {
+    U256::from_hex(self.range_start_hex)
+  }
+
+  #[inline]
+  pub fn total_keys(&self) -> U256 {
+    U256::bit(self.n_bits)
+  }
+
+  #[inline]
+  pub fn n_mask(&self) -> U256 {
+    self.total_keys().saturating_sub(U256::ONE)
+  }
+
+  #[inline]
+  pub fn range_end(&self) -> U256 {
+    let start = self.range_start();
+    let mask = self.n_mask();
+
+    U256 {
+      lo: start.lo | mask.lo,
+      hi: start.hi | mask.hi,
+    }
+  }
+
+  #[inline]
+  pub fn fits_u128(&self) -> bool {
+    self.n_bits <= 127
+  }
+
+  #[inline]
+  pub fn range_start_u128(&self) -> Option<u128> {
+    self.range_start().as_u128()
+  }
+
+  #[inline]
+  pub fn total_keys_u128(&self) -> Option<u128> {
+    self.total_keys().as_u128()
+  }
+
+  #[inline]
+  pub fn n_mask_u128(&self) -> Option<u128> {
+    self.n_mask().as_u128()
+  }
+
+  #[inline]
+  pub fn has_pubkey(&self) -> bool {
+    self.pubkey_hex.is_some()
+  }
+
+  pub fn pubkey_compressed(&self) -> Option<[u8; 33]> {
+    let h = self.pubkey_hex?;
+    if h.len() != 66 {
+      return None;
+    }
+
+    let mut out = [0u8; 33];
+    for i in 0..33 {
+      out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SearchMode {
+  Sequence,
+  Pcg,
 }
 
 #[derive(Clone)]
@@ -1338,36 +1264,6 @@ struct GpuSolver {
   baby_x: Option<CudaSlice<u32>>,
   baby_idx: Option<CudaSlice<u64>>,
   use_baby: i32,
-}
-
-fn pack_pubkey_x_limbs(compressed: &[u8; 33]) -> (u32, [u32; 8]) {
-  let prefix = compressed[0] as u32;
-  let mut limbs = [0u32; 8];
-
-  for (dst, chunk) in limbs.iter_mut().zip(compressed[1..].as_chunks::<4>().0.iter()) {
-    *dst = u32::from_be_bytes(*chunk);
-  }
-
-  (prefix, limbs)
-}
-
-fn u256_limbs(v: U256) -> (u64, u64, u64, u64) {
-  (v.lo as u64, (v.lo >> 64) as u64, v.hi as u64, (v.hi >> 64) as u64)
-}
-
-impl GpuSolver {
-  #[inline]
-  fn effective_keys_per_thread(&self) -> u32 {
-    self.parallel_keys.max(1)
-  }
-
-  #[inline]
-  fn launch_capacity(&self) -> u128 {
-    (self.block_size as u128)
-      .saturating_mul(self.grid_size as u128)
-      .saturating_mul(self.effective_keys_per_thread() as u128)
-      .max(1)
-  }
 }
 
 impl GpuSolver {
@@ -1464,6 +1360,19 @@ impl GpuSolver {
       baby_idx,
       use_baby,
     })
+  }
+
+  #[inline]
+  fn effective_keys_per_thread(&self) -> u32 {
+    self.parallel_keys.max(1)
+  }
+
+  #[inline]
+  fn launch_capacity(&self) -> u128 {
+    (self.block_size as u128)
+      .saturating_mul(self.grid_size as u128)
+      .saturating_mul(self.effective_keys_per_thread() as u128)
+      .max(1)
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -1617,27 +1526,6 @@ impl GpuSolver {
   }
 }
 
-#[inline(always)]
-fn umul128(
-  a: u128,
-  b: u128,
-) -> (u128, u128) {
-  let a0 = a as u64;
-  let a1 = (a >> 64) as u64;
-  let b0 = b as u64;
-  let b1 = (b >> 64) as u64;
-
-  let p00 = (a0 as u128) * (b0 as u128);
-  let p01 = (a0 as u128) * (b1 as u128);
-  let p10 = (a1 as u128) * (b0 as u128);
-  let p11 = (a1 as u128) * (b1 as u128);
-
-  let mid = (p00 >> 64) + (p01 & 0xffff_ffff_ffff_ffff) + (p10 & 0xffff_ffff_ffff_ffff);
-  let lo = (p00 & 0xffff_ffff_ffff_ffff) | (mid << 64);
-  let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
-  (lo, hi)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct PcgConsts {
   pub a: U256,
@@ -1683,6 +1571,564 @@ impl PcgConsts {
   pub fn for_local_machine(puzzle: u32) -> Self {
     Self::derive(&kernel::compute_machine_fingerprint(), puzzle)
   }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllCycleState {
+  pub index: usize,
+  pub sweep: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GpuInventory {
+  pub devices: Vec<GpuLaunchConfig>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KernelType {
+  ChudnovskyAddG,
+  ChudnovskyMeloniCoZ,
+
+  Jacobian,
+  JacobianCoZMeloni,
+  JacobianLinearGlv,
+  JacobianEndoGlv,
+  JacobianKaratsuba,
+
+  ProjectiveAddGLazy,
+  ProjectiveBaby,
+  ProjectiveRestrictedGlv,
+  ProjectiveLatticeGlv,
+  ProjectiveXOnlyRegG,
+  ProjectiveXZBatch,
+  ProjectiveZFactorBatch,
+
+  Xyzz,
+
+  XzDifferential,
+
+  Test,
+  Demo,
+}
+
+impl KernelType {
+  pub const ALL: &'static [KernelType] = &[
+    KernelType::ChudnovskyAddG,
+    KernelType::ChudnovskyMeloniCoZ,
+    KernelType::Jacobian,
+    KernelType::JacobianCoZMeloni,
+    KernelType::JacobianLinearGlv,
+    KernelType::JacobianEndoGlv,
+    KernelType::JacobianKaratsuba,
+    KernelType::ProjectiveAddGLazy,
+    KernelType::ProjectiveRestrictedGlv,
+    KernelType::ProjectiveLatticeGlv,
+    KernelType::ProjectiveXOnlyRegG,
+    KernelType::ProjectiveXZBatch,
+    KernelType::ProjectiveZFactorBatch,
+    KernelType::ProjectiveBaby,
+    KernelType::Xyzz,
+    KernelType::XzDifferential,
+    KernelType::Test,
+    KernelType::Demo,
+  ];
+
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::ChudnovskyAddG => "chudnovsky_addg",
+      Self::ChudnovskyMeloniCoZ => "chudnovsky_meloni_coz",
+
+      Self::Jacobian => "jacobian",
+      Self::JacobianCoZMeloni => "jacobian_coz_meloni",
+      Self::JacobianLinearGlv => "jacobian_linear_glv",
+      Self::JacobianEndoGlv => "jacobian_endo_glv",
+      Self::JacobianKaratsuba => "jacobian_karatsuba",
+
+      Self::ProjectiveAddGLazy => "projective_addg_lazy",
+      Self::ProjectiveBaby => "projective_baby",
+      Self::ProjectiveRestrictedGlv => "projective_restricted_glv",
+      Self::ProjectiveLatticeGlv => "projective_lattice_glv",
+      Self::ProjectiveXOnlyRegG => "projective_x_only_regg",
+      Self::ProjectiveXZBatch => "projective_xz_batch",
+      Self::ProjectiveZFactorBatch => "projective_zfactor_batch",
+
+      Self::Xyzz => "xyzz",
+
+      Self::XzDifferential => "xz_differential",
+
+      Self::Test => "test",
+      Self::Demo => "demo",
+    }
+  }
+
+  pub fn kernel_name(self) -> &'static str {
+    match self {
+      Self::ChudnovskyAddG => "kernel-chudnovsky_addg",
+      Self::ChudnovskyMeloniCoZ => "kernel-chudnovsky_meloni_coz",
+
+      Self::Jacobian => "kernel-jacobian",
+      Self::JacobianCoZMeloni => "kernel-jacobian_coz_meloni",
+      Self::JacobianLinearGlv => "kernel-jacobian-linear_glv",
+      Self::JacobianEndoGlv => "kernel-jacobian_endo_glv",
+      Self::JacobianKaratsuba => "kernel-jacobian_karatsuba",
+
+      Self::ProjectiveAddGLazy => "kernel-projective_addg_lazy",
+      Self::ProjectiveRestrictedGlv => "kernel-projective_restricted_glv",
+      Self::ProjectiveLatticeGlv => "kernel-projective_lattice_glv",
+      Self::ProjectiveXOnlyRegG => "kernel-projective_x_only_regg",
+      Self::ProjectiveXZBatch => "kernel-projective_xz_batch",
+      Self::ProjectiveBaby => "kernel-projective_baby",
+      Self::ProjectiveZFactorBatch => "kernel-projective_zfactor_batch",
+
+      Self::Xyzz => "kernel-xyzz",
+
+      Self::XzDifferential => "kernel-xz_differential",
+
+      Self::Test => "kernel-test",
+      Self::Demo => "kernel-demo",
+    }
+  }
+
+  pub fn display_name(self) -> &'static str {
+    match self {
+      Self::ChudnovskyAddG => "Chudnovsky + AddG",
+      Self::ChudnovskyMeloniCoZ => "Chudnovsky + Meloni + CoZ",
+
+      Self::Jacobian => "Jacobian",
+      Self::JacobianCoZMeloni => "Jacobian + CoZ + Meloni",
+      Self::JacobianLinearGlv => "Jacobian + Linear + GLV",
+      Self::JacobianEndoGlv => "Jacobian + Endo + GLV",
+      Self::JacobianKaratsuba => "Jacobian + Karatsuba",
+
+      Self::ProjectiveAddGLazy => "Projective + AddG + Lazy",
+      Self::ProjectiveRestrictedGlv => "Projective + Restricted GLV",
+      Self::ProjectiveLatticeGlv => "Projective + Lattice GLV",
+      Self::ProjectiveXOnlyRegG => "Projective + X-Only + RegG",
+      Self::ProjectiveXZBatch => "Projective + XZ-batch",
+      Self::ProjectiveZFactorBatch => "Projective + Z-factor batch",
+      Self::ProjectiveBaby => "Projective + small BSGS",
+
+      Self::Xyzz => "XYZZ",
+
+      Self::XzDifferential => "XZ differential",
+
+      Self::Test => "Test",
+      Self::Demo => "Demo",
+    }
+  }
+
+  pub fn from_string(s: &str) -> Option<Self> {
+    match s.to_ascii_lowercase().as_str() {
+      "chudnovsky_addg" | "kernel-chudnovsky_addg" => Some(Self::ChudnovskyAddG),
+      "chudnovsky_meloni_coz" | "kernel-chudnovsky_meloni_coz" => Some(Self::ChudnovskyMeloniCoZ),
+
+      "jacobian" | "kernel-jacobian" => Some(Self::Jacobian),
+      "jacobian_coz_meloni" | "kernel-jacobian_coz_meloni" => Some(Self::JacobianCoZMeloni),
+      "jacobian_linear_glv" | "kernel-jacobian_linear_glv" => Some(Self::JacobianLinearGlv),
+      "jacobian_endo_glv" | "kernel-jacobian_endo_glv" => Some(Self::JacobianEndoGlv),
+      "jacobian_karatsuba" | "kernel-jacobian_karatsuba" => Some(Self::JacobianKaratsuba),
+
+      "projective_addg_lazy" | "kernel-projective_addg_lazy" => Some(Self::ProjectiveAddGLazy),
+      "projective_baby" | "kernel-projective_baby" => Some(Self::ProjectiveBaby),
+      "projective_restricted_glv" | "kernel-projective_restricted_glv" => Some(Self::ProjectiveRestrictedGlv),
+      "projective_lattice_glv" | "kernel-projective_lattice_glv" => Some(Self::ProjectiveLatticeGlv),
+      "projective_x_only_regg" | "kernel-projective_x_only_regg" => Some(Self::ProjectiveXOnlyRegG),
+      "projective_xz_batch" | "kernel-projective_xz_batch" => Some(Self::ProjectiveXZBatch),
+      "projective_zfactor_batch" | "kernel-projective_zfactor_batch" => Some(Self::ProjectiveZFactorBatch),
+
+      "xyzz" | "kernel-xyzz" => Some(Self::Xyzz),
+
+      "xz_differential" | "kernel-xz_differential" => Some(Self::XzDifferential),
+
+      "test" | "kernel-test" => Some(Self::Test),
+      "demo" | "kernel-demo" => Some(Self::Demo),
+
+      _ => None,
+    }
+  }
+
+  pub fn all() -> &'static [KernelType] {
+    Self::ALL
+  }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KernelRegistry {
+  sizes: std::collections::HashMap<KernelType, Vec<String>>,
+  pub images: std::collections::HashMap<String, Vec<u8>>,
+  pub machine_fingerprint: [u8; 32],
+  pub is_demo: bool,
+}
+
+impl KernelRegistry {
+  pub fn empty() -> Self {
+    Self::default()
+  }
+
+  pub fn from_package(
+    encrypted_kernels: std::collections::BTreeMap<String, Vec<u8>>,
+    machine_fingerprint: [u8; 32],
+  ) -> Self {
+    let mut sizes: std::collections::HashMap<KernelType, Vec<String>> = std::collections::HashMap::new();
+    let mut images: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+
+    for (name, bytes) in encrypted_kernels {
+      Self::ingest_name(&name, &mut sizes);
+      images.insert(name, bytes);
+    }
+
+    for v in sizes.values_mut() {
+      v.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
+      v.dedup();
+    }
+
+    let is_demo = !images.is_empty()
+      && images.keys().all(|k| {
+        let name = std::path::Path::new(k).file_name().and_then(|n| n.to_str()).unwrap_or(k);
+        name.starts_with("kernel-demo-") && name.ends_with(".cubin")
+      });
+
+    if is_demo {
+      let mut demo_sizes: Vec<String> = sizes.get(&KernelType::Demo).cloned().unwrap_or_default();
+      if demo_sizes.is_empty() {
+        for key in images.keys() {
+          if let Some(stem) = key.strip_suffix(".cubin") {
+            let mut parts: Vec<&str> = stem.split('-').collect();
+            if parts
+              .last()
+              .map(|p| p.starts_with("sm_") && p[3..].chars().all(|c| c.is_ascii_digit()))
+              .unwrap_or(false)
+            {
+              parts.pop();
+            }
+            if let Some(sz) = parts.last()
+              && sz.parse::<u32>().is_ok()
+            {
+              demo_sizes.push((*sz).to_string());
+            }
+          }
+        }
+        demo_sizes.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
+        demo_sizes.dedup();
+      }
+
+      for &fallback in &["128", "512", "1024", "1664", "2048", "4096"] {
+        if !demo_sizes.iter().any(|s| s == fallback) {
+          demo_sizes.push(fallback.to_string());
+        }
+      }
+
+      demo_sizes.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
+      demo_sizes.dedup();
+      sizes.clear();
+
+      for &ty in KernelType::ALL {
+        if matches!(ty, KernelType::Test | KernelType::Demo) {
+          continue;
+        }
+
+        sizes.insert(ty, demo_sizes.clone());
+      }
+    }
+
+    Self {
+      sizes,
+      images,
+      machine_fingerprint,
+      is_demo,
+    }
+  }
+
+  pub fn encrypted_blob(
+    &self,
+    name: &str,
+  ) -> Option<&[u8]> {
+    self.images.get(name).map(|v| v.as_slice())
+  }
+
+  fn ingest_name(
+    name: &str,
+    sizes: &mut std::collections::HashMap<KernelType, Vec<String>>,
+  ) {
+    let name = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+
+    let Some(stem) = name.strip_suffix(".cubin") else {
+      return;
+    };
+
+    let mut parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 3 || parts[0] != "kernel" {
+      return;
+    }
+
+    if parts
+      .last()
+      .map(|p| p.starts_with("sm_") && p[3..].chars().all(|c| c.is_ascii_digit()))
+      .unwrap_or(false)
+    {
+      parts.pop();
+    }
+
+    if parts.len() < 3 {
+      return;
+    }
+
+    let size_str = parts[parts.len() - 1];
+
+    if size_str.parse::<u32>().is_err() {
+      return;
+    }
+
+    let type_str = parts[1..parts.len() - 1].join("_");
+    let type_alt = parts[1..parts.len() - 1].join("-");
+    let ty = KernelType::from_string(&type_str)
+      .or_else(|| KernelType::from_string(&type_alt))
+      .or_else(|| KernelType::from_string(&format!("kernel-{}", type_str)))
+      .or_else(|| KernelType::from_string(&format!("kernel-{}", type_alt)));
+
+    let Some(ty) = ty else {
+      return;
+    };
+
+    sizes.entry(ty).or_default().push(size_str.to_string());
+  }
+
+  pub fn sizes_for(
+    &self,
+    ty: KernelType,
+  ) -> &[String] {
+    self.sizes.get(&ty).map(|v| v.as_slice()).unwrap_or(&[])
+  }
+
+  pub fn has(
+    &self,
+    ty: KernelType,
+    size: &str,
+  ) -> bool {
+    self.sizes_for(ty).iter().any(|s| s == size)
+  }
+
+  pub fn default_size_for(
+    &self,
+    ty: KernelType,
+  ) -> Option<&str> {
+    let sizes = self.sizes_for(ty);
+
+    if sizes.is_empty() {
+      return None;
+    }
+
+    if sizes.iter().any(|s| s == "1024") {
+      Some("1024")
+    } else {
+      Some(sizes[0].as_str())
+    }
+  }
+
+  pub fn first_available_type(&self) -> Option<KernelType> {
+    for ty in KernelType::all() {
+      if !self.sizes_for(*ty).is_empty() {
+        return Some(*ty);
+      }
+    }
+    None
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct KernelInfo {
+  pub kernel_type: KernelType,
+  pub kernel_size: String,
+  pub image_name: String,
+  pub cubin_bytes: Vec<u8>,
+}
+
+impl Default for KernelInfo {
+  fn default() -> Self {
+    Self {
+      kernel_type: KernelType::Jacobian,
+      kernel_size: "1024".to_string(),
+      image_name: "kernel-jacobian-1024.cubin".to_string(),
+      cubin_bytes: Vec::new(),
+    }
+  }
+}
+
+impl Drop for KernelInfo {
+  fn drop(&mut self) {
+    self.cubin_bytes.zeroize();
+  }
+}
+
+impl KernelInfo {
+  pub fn image_bytes(&self) -> usize {
+    self.cubin_bytes.len()
+  }
+
+  pub fn to_module_image(&self) -> Ptx {
+    Ptx::from_binary(self.cubin_bytes.clone())
+  }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuLaunchConfig {
+  pub device_id: u32,
+  pub name: String,
+  pub compute_cap: String,
+  pub sm_count: u32,
+  pub clock_mhz: u32,
+  pub max_threads_per_block: u32,
+  pub warp_size: u32,
+  pub max_grid_dim_x: u32,
+
+  pub block_size: u32,
+  pub grid_size: u32,
+  pub parallel_keys: u32,
+  pub chunk_size: u128,
+
+  pub kernel_type: KernelType,
+  pub kernel_size: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BenchmarkResult {
+  pub block_size: u32,
+  pub grid_size: u32,
+  pub parallel_keys: u32,
+  pub chunk_multiplier: u32,
+  pub speed_mkeys: f64,
+  pub kernel_type: KernelType,
+  pub kernel_size: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CpuInfo {
+  pub model: String,
+  pub cores: usize,
+  pub threads: usize,
+  pub freq_mhz: f64,
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
+pub fn active_puzzles() -> &'static [PuzzleInfo] {
+  #[cfg(feature = "test_vectors")]
+  {
+    crate::test_vector::test_puzzle_infos()
+  }
+
+  #[cfg(not(feature = "test_vectors"))]
+  {
+    UNSOLVED_PUZZLES
+  }
+}
+
+pub fn puzzle_by_number(n: u32) -> Option<&'static PuzzleInfo> {
+  active_puzzles().iter().find(|p| p.number == n)
+}
+
+pub fn default_puzzle() -> &'static PuzzleInfo {
+  puzzle_by_number(DEFAULT_PUZZLE).expect("default puzzle 72 is in the table")
+}
+
+pub fn request_bench_cancel() {
+  BENCH_CANCEL.store(true, Ordering::Relaxed);
+}
+
+pub fn clear_bench_cancel() {
+  BENCH_CANCEL.store(false, Ordering::Relaxed);
+}
+
+pub fn bench_cancel_requested() -> bool {
+  BENCH_CANCEL.load(Ordering::Relaxed)
+}
+
+pub fn report_gpu_error(msg: impl Into<String>) {
+  let m = msg.into();
+  crate::app_log!("{}", m);
+  if let Ok(mut slot) = LAST_GPU_ERROR.lock() {
+    *slot = m;
+  }
+}
+
+pub fn take_gpu_error(clear: bool) -> Option<String> {
+  let Ok(mut slot) = LAST_GPU_ERROR.lock() else {
+    return None;
+  };
+
+  if slot.is_empty() {
+    return None;
+  }
+
+  let out = slot.clone();
+  if clear {
+    slot.clear();
+  }
+
+  Some(out)
+}
+
+pub fn clear_gpu_error() {
+  if let Ok(mut slot) = LAST_GPU_ERROR.lock() {
+    slot.clear();
+  }
+}
+
+fn format_cuda_oom_or(
+  action: &str,
+  device_hint: &str,
+  err: impl std::fmt::Debug,
+) -> Box<dyn std::error::Error> {
+  let s = format!("{:?}", err);
+  let lower = s.to_lowercase();
+  if lower.contains("out of memory") || lower.contains("cuda_error_out_of_memory") {
+    format!(
+      "GPU out of memory while trying to {} on {}. \
+The selected kernel size / keys-per-thread is too large for this GPU's VRAM or local memory. \
+Try a smaller size or lower parallel keys. \
+Driver detail: {}",
+      action, device_hint, s
+    )
+    .into()
+  } else {
+    format!("CUDA error while trying to {} on {}: {:?}", action, device_hint, err).into()
+  }
+}
+
+fn pack_pubkey_x_limbs(compressed: &[u8; 33]) -> (u32, [u32; 8]) {
+  let prefix = compressed[0] as u32;
+  let mut limbs = [0u32; 8];
+
+  for (dst, chunk) in limbs.iter_mut().zip(compressed[1..].as_chunks::<4>().0.iter()) {
+    *dst = u32::from_be_bytes(*chunk);
+  }
+
+  (prefix, limbs)
+}
+
+fn u256_limbs(v: U256) -> (u64, u64, u64, u64) {
+  (v.lo as u64, (v.lo >> 64) as u64, v.hi as u64, (v.hi >> 64) as u64)
+}
+
+#[inline(always)]
+fn umul128(
+  a: u128,
+  b: u128,
+) -> (u128, u128) {
+  let a0 = a as u64;
+  let a1 = (a >> 64) as u64;
+  let b0 = b as u64;
+  let b1 = (b >> 64) as u64;
+
+  let p00 = (a0 as u128) * (b0 as u128);
+  let p01 = (a0 as u128) * (b1 as u128);
+  let p10 = (a1 as u128) * (b0 as u128);
+  let p11 = (a1 as u128) * (b1 as u128);
+
+  let mid = (p00 >> 64) + (p01 & 0xffff_ffff_ffff_ffff) + (p10 & 0xffff_ffff_ffff_ffff);
+  let lo = (p00 & 0xffff_ffff_ffff_ffff) | (mid << 64);
+  let hi = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
+  (lo, hi)
 }
 
 #[inline(always)]
@@ -1813,8 +2259,6 @@ fn setup_status_dir(
 }
 
 fn backup_last_session() {
-  use chrono::Local;
-
   let has_content = Path::new(STATUS_DIR).exists() && fs::read_dir(STATUS_DIR).map(|mut d| d.next().is_some()).unwrap_or(false);
   if !has_content {
     return;
@@ -1903,26 +2347,6 @@ fn load_assignment_log_from_path(path: &str) -> (VecDeque<Chunk>, U256) {
   }
 
   (pending, farthest_end)
-}
-
-fn main() {
-  backup_last_session();
-
-  let dash_state = Arc::new(Mutex::new(gui::DashboardState::default()));
-
-  let options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default()
-      .with_inner_size([1024.0, 768.0])
-      .with_maximized(true)
-      .with_title(format!("{} - {}", APP_NAME.unwrap_or_default(), APP_VERSION.unwrap_or_default())),
-    ..Default::default()
-  };
-
-  let _ = eframe::run_native(
-    APP_NAME.unwrap_or_default(),
-    options,
-    Box::new(move |_cc| Ok(Box::new(gui::KeyHunterApp::new(dash_state, String::from("Both"), SearchMode::Sequence)))),
-  );
 }
 
 fn recover_allocator(
@@ -2660,12 +3084,6 @@ pub fn setup_all_status_dir() {
   }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AllCycleState {
-  pub index: usize,
-  pub sweep: u64,
-}
-
 pub fn load_all_cycle_state() -> AllCycleState {
   setup_all_status_dir();
   let path = all_cycle_state_path();
@@ -2739,359 +3157,6 @@ fn all_mode_turn_exhausted() -> bool {
   now_ms >= deadline
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum KernelType {
-  ChudnovskyAddG,
-  ChudnovskyMeloniCoZ,
-
-  Jacobian,
-  JacobianCoZMeloni,
-  JacobianLinearGlv,
-  JacobianEndoGlv,
-  JacobianKaratsuba,
-
-  ProjectiveAddGLazy,
-  ProjectiveBaby,
-  ProjectiveRestrictedGlv,
-  ProjectiveLatticeGlv,
-  ProjectiveXOnlyRegG,
-  ProjectiveXZBatch,
-  ProjectiveZFactorBatch,
-
-  Xyzz,
-
-  XzDifferential,
-
-  Test,
-  Demo,
-}
-
-impl KernelType {
-  pub const ALL: &'static [KernelType] = &[
-    KernelType::ChudnovskyAddG,
-    KernelType::ChudnovskyMeloniCoZ,
-    KernelType::Jacobian,
-    KernelType::JacobianCoZMeloni,
-    KernelType::JacobianLinearGlv,
-    KernelType::JacobianEndoGlv,
-    KernelType::JacobianKaratsuba,
-    KernelType::ProjectiveAddGLazy,
-    KernelType::ProjectiveRestrictedGlv,
-    KernelType::ProjectiveLatticeGlv,
-    KernelType::ProjectiveXOnlyRegG,
-    KernelType::ProjectiveXZBatch,
-    KernelType::ProjectiveZFactorBatch,
-    KernelType::ProjectiveBaby,
-    KernelType::Xyzz,
-    KernelType::XzDifferential,
-    KernelType::Test,
-    KernelType::Demo,
-  ];
-
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Self::ChudnovskyAddG => "chudnovsky_addg",
-      Self::ChudnovskyMeloniCoZ => "chudnovsky_meloni_coz",
-
-      Self::Jacobian => "jacobian",
-      Self::JacobianCoZMeloni => "jacobian_coz_meloni",
-      Self::JacobianLinearGlv => "jacobian_linear_glv",
-      Self::JacobianEndoGlv => "jacobian_endo_glv",
-      Self::JacobianKaratsuba => "jacobian_karatsuba",
-
-      Self::ProjectiveAddGLazy => "projective_addg_lazy",
-      Self::ProjectiveBaby => "projective_baby",
-      Self::ProjectiveRestrictedGlv => "projective_restricted_glv",
-      Self::ProjectiveLatticeGlv => "projective_lattice_glv",
-      Self::ProjectiveXOnlyRegG => "projective_x_only_regg",
-      Self::ProjectiveXZBatch => "projective_xz_batch",
-      Self::ProjectiveZFactorBatch => "projective_zfactor_batch",
-
-      Self::Xyzz => "xyzz",
-
-      Self::XzDifferential => "xz_differential",
-
-      Self::Test => "test",
-      Self::Demo => "demo",
-    }
-  }
-
-  pub fn kernel_name(self) -> &'static str {
-    match self {
-      Self::ChudnovskyAddG => "kernel-chudnovsky_addg",
-      Self::ChudnovskyMeloniCoZ => "kernel-chudnovsky_meloni_coz",
-
-      Self::Jacobian => "kernel-jacobian",
-      Self::JacobianCoZMeloni => "kernel-jacobian_coz_meloni",
-      Self::JacobianLinearGlv => "kernel-jacobian-linear_glv",
-      Self::JacobianEndoGlv => "kernel-jacobian_endo_glv",
-      Self::JacobianKaratsuba => "kernel-jacobian_karatsuba",
-
-      Self::ProjectiveAddGLazy => "kernel-projective_addg_lazy",
-      Self::ProjectiveRestrictedGlv => "kernel-projective_restricted_glv",
-      Self::ProjectiveLatticeGlv => "kernel-projective_lattice_glv",
-      Self::ProjectiveXOnlyRegG => "kernel-projective_x_only_regg",
-      Self::ProjectiveXZBatch => "kernel-projective_xz_batch",
-      Self::ProjectiveBaby => "kernel-projective_baby",
-      Self::ProjectiveZFactorBatch => "kernel-projective_zfactor_batch",
-
-      Self::Xyzz => "kernel-xyzz",
-
-      Self::XzDifferential => "kernel-xz_differential",
-
-      Self::Test => "kernel-test",
-      Self::Demo => "kernel-demo",
-    }
-  }
-
-  pub fn display_name(self) -> &'static str {
-    match self {
-      Self::ChudnovskyAddG => "Chudnovsky + AddG",
-      Self::ChudnovskyMeloniCoZ => "Chudnovsky + Meloni + CoZ",
-
-      Self::Jacobian => "Jacobian",
-      Self::JacobianCoZMeloni => "Jacobian + CoZ + Meloni",
-      Self::JacobianLinearGlv => "Jacobian + Linear + GLV",
-      Self::JacobianEndoGlv => "Jacobian + Endo + GLV",
-      Self::JacobianKaratsuba => "Jacobian + Karatsuba",
-
-      Self::ProjectiveAddGLazy => "Projective + AddG + Lazy",
-      Self::ProjectiveRestrictedGlv => "Projective + Restricted GLV",
-      Self::ProjectiveLatticeGlv => "Projective + Lattice GLV",
-      Self::ProjectiveXOnlyRegG => "Projective + X-Only + RegG",
-      Self::ProjectiveXZBatch => "Projective + XZ-batch",
-      Self::ProjectiveZFactorBatch => "Projective + Z-factor batch",
-      Self::ProjectiveBaby => "Projective + small BSGS",
-
-      Self::Xyzz => "XYZZ",
-
-      Self::XzDifferential => "XZ differential",
-
-      Self::Test => "Test",
-      Self::Demo => "Demo",
-    }
-  }
-
-  pub fn from_string(s: &str) -> Option<Self> {
-    match s.to_ascii_lowercase().as_str() {
-      "chudnovsky_addg" | "kernel-chudnovsky_addg" => Some(Self::ChudnovskyAddG),
-      "chudnovsky_meloni_coz" | "kernel-chudnovsky_meloni_coz" => Some(Self::ChudnovskyMeloniCoZ),
-
-      "jacobian" | "kernel-jacobian" => Some(Self::Jacobian),
-      "jacobian_coz_meloni" | "kernel-jacobian_coz_meloni" => Some(Self::JacobianCoZMeloni),
-      "jacobian_linear_glv" | "kernel-jacobian_linear_glv" => Some(Self::JacobianLinearGlv),
-      "jacobian_endo_glv" | "kernel-jacobian_endo_glv" => Some(Self::JacobianEndoGlv),
-      "jacobian_karatsuba" | "kernel-jacobian_karatsuba" => Some(Self::JacobianKaratsuba),
-
-      "projective_addg_lazy" | "kernel-projective_addg_lazy" => Some(Self::ProjectiveAddGLazy),
-      "projective_baby" | "kernel-projective_baby" => Some(Self::ProjectiveBaby),
-      "projective_restricted_glv" | "kernel-projective_restricted_glv" => Some(Self::ProjectiveRestrictedGlv),
-      "projective_lattice_glv" | "kernel-projective_lattice_glv" => Some(Self::ProjectiveLatticeGlv),
-      "projective_x_only_regg" | "kernel-projective_x_only_regg" => Some(Self::ProjectiveXOnlyRegG),
-      "projective_xz_batch" | "kernel-projective_xz_batch" => Some(Self::ProjectiveXZBatch),
-      "projective_zfactor_batch" | "kernel-projective_zfactor_batch" => Some(Self::ProjectiveZFactorBatch),
-
-      "xyzz" | "kernel-xyzz" => Some(Self::Xyzz),
-
-      "xz_differential" | "kernel-xz_differential" => Some(Self::XzDifferential),
-
-      "test" | "kernel-test" => Some(Self::Test),
-      "demo" | "kernel-demo" => Some(Self::Demo),
-
-      _ => None,
-    }
-  }
-
-  pub fn all() -> &'static [KernelType] {
-    Self::ALL
-  }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct KernelRegistry {
-  sizes: std::collections::HashMap<KernelType, Vec<String>>,
-  pub images: std::collections::HashMap<String, Vec<u8>>,
-  pub machine_fingerprint: [u8; 32],
-  pub is_demo: bool,
-}
-
-impl KernelRegistry {
-  pub fn empty() -> Self {
-    Self::default()
-  }
-
-  pub fn from_package(
-    encrypted_kernels: std::collections::BTreeMap<String, Vec<u8>>,
-    machine_fingerprint: [u8; 32],
-  ) -> Self {
-    let mut sizes: std::collections::HashMap<KernelType, Vec<String>> = std::collections::HashMap::new();
-    let mut images: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-
-    for (name, bytes) in encrypted_kernels {
-      Self::ingest_name(&name, &mut sizes);
-      images.insert(name, bytes);
-    }
-
-    for v in sizes.values_mut() {
-      v.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
-      v.dedup();
-    }
-
-    let is_demo = !images.is_empty()
-      && images.keys().all(|k| {
-        let name = std::path::Path::new(k).file_name().and_then(|n| n.to_str()).unwrap_or(k);
-        name.starts_with("kernel-demo-") && name.ends_with(".cubin")
-      });
-
-    if is_demo {
-      let mut demo_sizes: Vec<String> = sizes.get(&KernelType::Demo).cloned().unwrap_or_default();
-      if demo_sizes.is_empty() {
-        for key in images.keys() {
-          if let Some(stem) = key.strip_suffix(".cubin") {
-            let mut parts: Vec<&str> = stem.split('-').collect();
-            if parts
-              .last()
-              .map(|p| p.starts_with("sm_") && p[3..].chars().all(|c| c.is_ascii_digit()))
-              .unwrap_or(false)
-            {
-              parts.pop();
-            }
-            if let Some(sz) = parts.last()
-              && sz.parse::<u32>().is_ok()
-            {
-              demo_sizes.push((*sz).to_string());
-            }
-          }
-        }
-        demo_sizes.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
-        demo_sizes.dedup();
-      }
-
-      for &fallback in &["128", "512", "1024", "1664", "2048", "4096"] {
-        if !demo_sizes.iter().any(|s| s == fallback) {
-          demo_sizes.push(fallback.to_string());
-        }
-      }
-
-      demo_sizes.sort_by_key(|s| s.parse::<u32>().unwrap_or(0));
-      demo_sizes.dedup();
-      sizes.clear();
-
-      for &ty in KernelType::ALL {
-        if matches!(ty, KernelType::Test | KernelType::Demo) {
-          continue;
-        }
-
-        sizes.insert(ty, demo_sizes.clone());
-      }
-    }
-
-    Self {
-      sizes,
-      images,
-      machine_fingerprint,
-      is_demo,
-    }
-  }
-
-  pub fn encrypted_blob(
-    &self,
-    name: &str,
-  ) -> Option<&[u8]> {
-    self.images.get(name).map(|v| v.as_slice())
-  }
-
-  fn ingest_name(
-    name: &str,
-    sizes: &mut std::collections::HashMap<KernelType, Vec<String>>,
-  ) {
-    let name = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
-
-    let Some(stem) = name.strip_suffix(".cubin") else {
-      return;
-    };
-
-    let mut parts: Vec<&str> = stem.split('-').collect();
-    if parts.len() < 3 || parts[0] != "kernel" {
-      return;
-    }
-
-    if parts
-      .last()
-      .map(|p| p.starts_with("sm_") && p[3..].chars().all(|c| c.is_ascii_digit()))
-      .unwrap_or(false)
-    {
-      parts.pop();
-    }
-
-    if parts.len() < 3 {
-      return;
-    }
-
-    let size_str = parts[parts.len() - 1];
-
-    if size_str.parse::<u32>().is_err() {
-      return;
-    }
-
-    let type_str = parts[1..parts.len() - 1].join("_");
-    let type_alt = parts[1..parts.len() - 1].join("-");
-    let ty = KernelType::from_string(&type_str)
-      .or_else(|| KernelType::from_string(&type_alt))
-      .or_else(|| KernelType::from_string(&format!("kernel-{}", type_str)))
-      .or_else(|| KernelType::from_string(&format!("kernel-{}", type_alt)));
-
-    let Some(ty) = ty else {
-      return;
-    };
-
-    sizes.entry(ty).or_default().push(size_str.to_string());
-  }
-
-  pub fn sizes_for(
-    &self,
-    ty: KernelType,
-  ) -> &[String] {
-    self.sizes.get(&ty).map(|v| v.as_slice()).unwrap_or(&[])
-  }
-
-  pub fn has(
-    &self,
-    ty: KernelType,
-    size: &str,
-  ) -> bool {
-    self.sizes_for(ty).iter().any(|s| s == size)
-  }
-
-  pub fn default_size_for(
-    &self,
-    ty: KernelType,
-  ) -> Option<&str> {
-    let sizes = self.sizes_for(ty);
-
-    if sizes.is_empty() {
-      return None;
-    }
-
-    if sizes.iter().any(|s| s == "1024") {
-      Some("1024")
-    } else {
-      Some(sizes[0].as_str())
-    }
-  }
-
-  pub fn first_available_type(&self) -> Option<KernelType> {
-    for ty in KernelType::all() {
-      if !self.sizes_for(*ty).is_empty() {
-        return Some(*ty);
-      }
-    }
-    None
-  }
-}
-
-pub static ACTIVE_PACKAGE: std::sync::Mutex<Option<KernelRegistry>> = std::sync::Mutex::new(None);
-
 pub fn set_active_package(reg: Option<KernelRegistry>) {
   *ACTIVE_PACKAGE.lock().unwrap() = reg;
 }
@@ -3102,42 +3167,6 @@ where
 {
   let guard = ACTIVE_PACKAGE.lock().unwrap();
   f(guard.as_ref())
-}
-
-#[derive(Clone, Debug)]
-pub struct KernelInfo {
-  pub kernel_type: KernelType,
-  pub kernel_size: String,
-  pub image_name: String,
-  pub cubin_bytes: Vec<u8>,
-}
-
-impl Default for KernelInfo {
-  fn default() -> Self {
-    Self {
-      kernel_type: KernelType::Jacobian,
-      kernel_size: "1024".to_string(),
-      image_name: "kernel-jacobian-1024.cubin".to_string(),
-      cubin_bytes: Vec::new(),
-    }
-  }
-}
-
-impl Drop for KernelInfo {
-  fn drop(&mut self) {
-    use zeroize::Zeroize;
-    self.cubin_bytes.zeroize();
-  }
-}
-
-impl KernelInfo {
-  pub fn image_bytes(&self) -> usize {
-    self.cubin_bytes.len()
-  }
-
-  pub fn to_module_image(&self) -> Ptx {
-    Ptx::from_binary(self.cubin_bytes.clone())
-  }
 }
 
 fn image_file_name(
@@ -3280,39 +3309,6 @@ pub fn kernel_info_default(registry: &KernelRegistry) -> Result<KernelInfo, Box<
 
   load_kernel_with_registry(ty, size, None, Some(registry))
 }
-
-#[derive(Clone, Debug)]
-pub struct GpuLaunchConfig {
-  pub device_id: u32,
-  pub name: String,
-  pub compute_cap: String,
-  pub sm_count: u32,
-  pub clock_mhz: u32,
-  pub max_threads_per_block: u32,
-  pub warp_size: u32,
-  pub max_grid_dim_x: u32,
-
-  pub block_size: u32,
-  pub grid_size: u32,
-  pub parallel_keys: u32,
-  pub chunk_size: u128,
-
-  pub kernel_type: KernelType,
-  pub kernel_size: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct BenchmarkResult {
-  pub block_size: u32,
-  pub grid_size: u32,
-  pub parallel_keys: u32,
-  pub chunk_multiplier: u32,
-  pub speed_mkeys: f64,
-  pub kernel_type: KernelType,
-  pub kernel_size: String,
-}
-
-pub type BenchProgressFn = Box<dyn Fn(usize, usize, &str, Option<f64>) + Send>;
 
 #[allow(clippy::too_many_arguments)]
 fn bench_one_config(
@@ -3972,14 +3968,6 @@ pub fn run_gpu_benchmark(
   best.ok_or_else(|| "Benchmark finished with no successful configuration".to_string())
 }
 
-#[derive(Clone, Debug)]
-pub struct CpuInfo {
-  pub model: String,
-  pub cores: usize,
-  pub threads: usize,
-  pub freq_mhz: f64,
-}
-
 pub fn detect_cpu_freq_mhz() -> f64 {
   let mut sum = 0.0_f64;
   let mut count = 0_u32;
@@ -4111,11 +4099,6 @@ pub fn format_clock_ghz(mhz: f64) -> String {
   } else {
     format!("{:.2} GHz", mhz / 1000.0)
   }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GpuInventory {
-  pub devices: Vec<GpuLaunchConfig>,
 }
 
 pub fn has_cuda_device() -> bool {
@@ -4265,11 +4248,6 @@ pub fn detect_gpus(
   Ok(GpuInventory { devices })
 }
 
-const GLOW_CURVE: [u8; 32] = [
-  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE, 0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
-  0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
-];
-
 fn mix_glow_sample(
   key: &[u8],
   data: &[u8],
@@ -4389,4 +4367,26 @@ pub fn build_graph_glow_effect(fingerprint_hex: &str) -> Option<String> {
   payload.extend_from_slice(&h160);
 
   Some(glow_base58check(&payload))
+}
+
+// -.-. --- .--. -.-- .-. .. --. .... - / -.-. --- -. - .-. --- .-.. / --- .-- .-..
+
+fn main() {
+  backup_last_session();
+
+  let dash_state = Arc::new(Mutex::new(gui::DashboardState::default()));
+
+  let options = eframe::NativeOptions {
+    viewport: egui::ViewportBuilder::default()
+      .with_inner_size([1024.0, 768.0])
+      .with_maximized(true)
+      .with_title(format!("{} - {}", APP_NAME.unwrap_or_default(), APP_VERSION.unwrap_or_default())),
+    ..Default::default()
+  };
+
+  let _ = eframe::run_native(
+    APP_NAME.unwrap_or_default(),
+    options,
+    Box::new(move |_cc| Ok(Box::new(gui::KeyHunterApp::new(dash_state, String::from("Both"), SearchMode::Sequence)))),
+  );
 }
