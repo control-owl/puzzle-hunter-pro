@@ -180,8 +180,8 @@ The first build takes several minutes because it compiles the GUI stack and the 
 | Goal | Command |
 |---|---|
 | Default, CUDA 13.0 (sm_50 to sm_121) | `cargo build --release` |
-| CUDA 12.3 (sm_50 to sm_120) | `cargo build --release --no-default-features --features cuda-12030` |
-| Legacy CUDA 11.8 (sm_30 to sm_37) | `cargo build --release --no-default-features --features cuda-11080` |
+| CUDA 12.3 (sm_50 to sm_120) | `cargo build --release --features cuda-12030` |
+| Legacy CUDA 11.8 (sm_30 to sm_37) | `cargo build --release --features cuda-11080` |
 
 ---
 

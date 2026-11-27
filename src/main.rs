@@ -91,6 +91,7 @@ static TOTAL_CHECKED_HIGH: AtomicU64 = AtomicU64::new(0);
 static FOUND: AtomicBool = AtomicBool::new(false);
 static PANIC_OCCURRED: AtomicBool = AtomicBool::new(false);
 static ALL_MODE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
 pub static UNSOLVED_PUZZLES: &[PuzzleInfo] = &[
   PuzzleInfo {
     number: 71,
@@ -870,7 +871,6 @@ pub type BenchProgressFn = Box<dyn Fn(usize, usize, &str, Option<f64>) + Send>;
 lazy_static::lazy_static! {
   static ref DASHBOARD: Arc<Mutex<Vec<ThreadStatus>>> = Arc::new(Mutex::new(Vec::new()));
   static ref FOUND_KEY_HEX: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
   static ref LAST_GPU_ERROR: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 }
 

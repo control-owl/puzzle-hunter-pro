@@ -256,6 +256,7 @@ struct LogEntry {
   message: String,
 }
 
+// TODO: Rewrite this better, create more structs
 pub struct KeyHunterApp {
   pub state: Arc<Mutex<DashboardState>>,
   pub device: String,
@@ -426,6 +427,7 @@ fn install_tray_wake_handlers() {
     if let Ok(mut q) = PENDING_TRAY_EVENTS.lock() {
       q.push_back(event);
     }
+
     tray_wake_ui();
   })));
 
@@ -433,6 +435,7 @@ fn install_tray_wake_handlers() {
     if let Ok(mut q) = PENDING_MENU_EVENTS.lock() {
       q.push_back(event);
     }
+
     tray_wake_ui();
   })));
 
@@ -526,29 +529,35 @@ fn sales_catalog() -> &'static [SalesPeriod] {
 }
 
 fn current_sales_status() -> (SalesAction, u8, String, String) {
-  let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(-5 * 3600).unwrap());
-  let now_naive = now.naive_local();
+  if cfg!(not(feature = "test_vectors")) {
+    let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(-5 * 3600).unwrap());
+    let now_naive = now.naive_local();
 
-  for period in sales_catalog() {
-    let start = chrono::NaiveDateTime::parse_from_str(period.start, "%Y-%m-%d %H:%M").unwrap_or_default();
-    let end = chrono::NaiveDateTime::parse_from_str(period.end, "%Y-%m-%d %H:%M").unwrap_or_default();
-    if now_naive >= start && now_naive < end {
-      let price = BASE_PRICE_BTC * (1.0 - period.discount_pct as f64 / 100.0);
-      let price_label = if period.discount_pct > 0 {
-        format!("{:.3} BTC  ({}% off)", price, period.discount_pct)
-      } else {
-        format!("{:.3} BTC", price)
-      };
-      return (period.action, period.discount_pct, price_label, period.note.to_string());
+    for period in sales_catalog() {
+      let start = chrono::NaiveDateTime::parse_from_str(period.start, "%Y-%m-%d %H:%M").unwrap_or_default();
+      let end = chrono::NaiveDateTime::parse_from_str(period.end, "%Y-%m-%d %H:%M").unwrap_or_default();
+
+      if now_naive >= start && now_naive < end {
+        let price = BASE_PRICE_BTC * (1.0 - period.discount_pct as f64 / 100.0);
+        let price_label = if period.discount_pct > 0 {
+          format!("{:.3} BTC  ({}% off)", price, period.discount_pct)
+        } else {
+          format!("{:.3} BTC", price)
+        };
+
+        return (period.action, period.discount_pct, price_label, period.note.to_string());
+      }
     }
-  }
 
-  (
-    SalesAction::NoSale,
-    0,
-    format!("{:.3} BTC", BASE_PRICE_BTC),
-    "Sales currently closed.".to_string(),
-  )
+    (
+      SalesAction::NoSale,
+      0,
+      format!("{:.3} BTC", BASE_PRICE_BTC),
+      "Sales currently closed.".to_string(),
+    )
+  } else {
+    (SalesAction::Sale, 0, format!("{:.3} BTC", BASE_PRICE_BTC), "Test mode".to_string())
+  }
 }
 
 fn delivery_route(fp_hex: &str) -> String {
@@ -709,6 +718,7 @@ impl eframe::App for KeyHunterApp {
     }
 
     self.poll_kernel_load();
+
     if self.kernels_loading {
       ui.ctx().request_repaint_after(Duration::from_millis(50));
     }
@@ -3381,12 +3391,7 @@ impl KeyHunterApp {
     };
 
     let coin = if is_demo { "none".to_string() } else { self.buy_coin.to_lowercase() };
-
-    let product = if self.buy_product.is_empty() {
-      PRO_PRODUCT_ID
-    } else {
-      self.buy_product.as_str()
-    };
+    let product = if cfg!(feature = "test_vectors") { "test" } else { PRO_PRODUCT_ID };
 
     let report = match &self.buy_report {
       Some(r) => r.clone(),

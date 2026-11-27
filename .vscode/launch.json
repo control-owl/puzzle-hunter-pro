@@ -27,5 +27,19 @@
       },
       "args": []
     },
+    {
+      "name": "Run release",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "run",
+          "--release",
+          "--bin=puzzle-hunter-pro",
+          "--features=default",
+        ]
+      },
+      "args": []
+    },
   ]
 }
